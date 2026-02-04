@@ -1,0 +1,10 @@
+[package]
+name = "fdrv"
+version = "0.1.0"
+edition = "2021"
+description = "AIC8800 WiFi 全功能驱动 - 对应LicheeRV-Nano-Build/aic8800_fdrv"
+
+[dependencies]
+bsp = { path = "../bsp" }
+ieee80211 = { path = "../../ieee80211" }
+log = { version = "0.4", default-features = false }

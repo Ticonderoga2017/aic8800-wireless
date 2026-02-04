@@ -1,0 +1,11 @@
+[package]
+name = "ieee80211"
+version = "0.1.0"
+edition = "2021"
+description = "IEEE 802.11 / cfg80211 / mac80211 抽象 - 复刻 aic8800 依赖的 Linux 无线栈接口"
+
+[dependencies]
+log = { version = "0.4", default-features = false }
+
+[features]
+default = []

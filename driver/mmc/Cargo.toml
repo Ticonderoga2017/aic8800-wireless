@@ -1,0 +1,8 @@
+[package]
+name = "mmc"
+version = "0.1.0"
+edition = "2021"
+description = "SDIO/MMC 总线抽象 - 对应 Linux 内核 MMC 子系统，aic8800 所依赖的功能模块"
+
+[dependencies]
+spin = { version = "0.9", default-features = false, features = ["mutex", "spin_mutex"] }

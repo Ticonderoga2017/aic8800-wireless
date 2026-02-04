@@ -1,0 +1,15 @@
+[package]
+name = "wireless"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[dependencies]
+bsp = { path = "driver/bsp" }
+fdrv = { path = "driver/fdrv" }
+ieee80211 = { path = "ieee80211" }
+mmc = { path = "driver/mmc" }
+log = { version = "0.4", default-features = false }

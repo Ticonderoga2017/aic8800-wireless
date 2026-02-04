@@ -1,0 +1,17 @@
+[package]
+name = "bsp"
+version = "0.1.0"
+edition = "2021"
+description = "AIC8800 WiFi BSP - 平台抽象层，对应LicheeRV-Nano-Build/aic8800_bsp"
+
+[features]
+# 启用后从 wireless/firmware 用 include_bytes! 嵌入 .bin，需先将 wifi-driver/firmware/*.bin 复制到该目录
+embed_firmware = []
+
+[dependencies]
+mmc = { path = "../mmc" }
+axerrno = "0.2"
+axhal = { path = "../../../arceos/modules/axhal", features = ["irq"] }
+axtask = { path = "../../../arceos/modules/axtask", features = ["multitask"] }
+log = { version = "0.4", default-features = false }
+spin = { version = "0.9", default-features = false, features = ["mutex", "once", "spin_mutex"] }
