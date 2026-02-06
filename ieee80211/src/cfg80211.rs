@@ -75,7 +75,7 @@ pub struct BssInfo {
     pub ssid_len: u8,
 }
 
-/// 站信息（对应 struct station_info，get_station 返回）
+/// 站信息（对应 struct station_info，get_station 返回，与 rwnx_fill_station_info 对齐）
 #[derive(Debug, Clone, Default)]
 pub struct StationInfo {
     pub filled: u64,
@@ -84,6 +84,23 @@ pub struct StationInfo {
     pub rx_rate: u32,
     pub tx_packets: u64,
     pub rx_packets: u64,
+    pub tx_failed: u32,
+    pub inactive_time_ms: u32,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+}
+
+/// NL80211_STA_INFO_* 位掩码，与 Linux include/uapi/linux/nl80211.h 一致
+pub mod nl80211_sta_info {
+    pub const TX_BITRATE: u64 = 1 << 0;
+    pub const RX_BITRATE: u64 = 1 << 1;
+    pub const SIGNAL: u64 = 1 << 2;
+    pub const TX_PACKETS: u64 = 1 << 3;
+    pub const RX_PACKETS: u64 = 1 << 4;
+    pub const TX_FAILED: u64 = 1 << 5;
+    pub const INACTIVE_TIME: u64 = 1 << 6;
+    pub const RX_BYTES: u64 = 1 << 7;
+    pub const TX_BYTES: u64 = 1 << 8;
 }
 
 /// Beacon 数据（对应 struct cfg80211_beacon_data，简化）

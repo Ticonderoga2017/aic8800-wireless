@@ -8,7 +8,7 @@ use alloc::string::String;
 use core::result::Result;
 
 // Re-export 自 ieee80211，与 LicheeRV cfg80211/mac80211 一一对应
-pub use ieee80211::{BssInfo, Ifindex, Nl80211Iftype, StationInfo};
+pub use ieee80211::{BssInfo, Ifindex, KeyStatus, Nl80211Iftype, StationInfo};
 
 /// 虚拟接口类型（NL80211_IFTYPE_*）— 与 ieee80211::Nl80211Iftype 同义
 pub type IfaceType = Nl80211Iftype;
@@ -54,9 +54,25 @@ pub trait WiphyOps {
     fn stop_ap(&mut self, iface_id: InterfaceId) -> Result<(), i32>;
     fn add_key(&mut self, iface_id: InterfaceId, key_index: u8, key_data: &[u8]) -> Result<(), i32>;
     fn del_key(&mut self, iface_id: InterfaceId, key_index: u8) -> Result<(), i32>;
+    /// 设置默认数据密钥（与 LicheeRV 一致：仅保存索引，不调 LMAC）
+    fn set_default_key(&mut self, iface_id: InterfaceId, key_index: u8) -> Result<(), i32>;
+    /// 查询密钥状态（与 LicheeRV get_key 一致；无 MM_GET_KEY 时从 add_key 状态返回）
+    fn get_key(&mut self, iface_id: InterfaceId, key_index: u8) -> Result<KeyStatus, i32>;
+    /// 设置默认管理帧密钥（与 LicheeRV 一致：仅保存，不调 LMAC）
+    fn set_default_mgmt_key(&mut self, iface_id: InterfaceId, key_index: u8) -> Result<(), i32>;
     fn get_station(&mut self, iface_id: InterfaceId, mac: &[u8; 6]) -> Result<StationInfo, i32>;
+    /// AP 模式添加关联站（与 LicheeRV add_station 一致；MM_STA_ADD_REQ）
+    fn add_station(&mut self, iface_id: InterfaceId, mac: &[u8; 6]) -> Result<(), i32>;
+    /// AP 模式删除站（与 LicheeRV del_station 一致；MM_STA_DEL_REQ，sta_idx）
+    fn del_station(&mut self, iface_id: InterfaceId, sta_idx: u8) -> Result<(), i32>;
     fn set_tx_power(&mut self, iface_id: InterfaceId, power: i32) -> Result<(), i32>;
     fn get_tx_power(&mut self, iface_id: InterfaceId) -> Result<i32, i32>;
+    /// 当前信道（与 LicheeRV get_channel 一致；无信道上下文时返回 -ENODATA）
+    fn get_channel(&mut self, iface_id: InterfaceId) -> Result<u8, i32>;
+    /// 省电模式（与 LicheeRV set_power_mgmt 一致；可选 MM_SET_PS_MODE）
+    fn set_power_mgmt(&mut self, iface_id: InterfaceId, enabled: bool) -> Result<(), i32>;
+    /// wiphy 参数（RTS/分片阈值等）；可选，未实现返回 -ENOSYS
+    fn set_wiphy_params(&mut self, _rts_threshold: Option<i32>, _frag_threshold: Option<i32>) -> Result<(), i32>;
 }
 
 /// 默认实现：所有操作返回“未实现”，用于占位与测试
@@ -112,7 +128,27 @@ impl WiphyOps for WiphyOpsStub {
         Err(-38)
     }
 
+    fn set_default_key(&mut self, _iface_id: InterfaceId, _key_index: u8) -> Result<(), i32> {
+        Ok(())
+    }
+
+    fn get_key(&mut self, _iface_id: InterfaceId, _key_index: u8) -> Result<KeyStatus, i32> {
+        Err(-38)
+    }
+
+    fn set_default_mgmt_key(&mut self, _iface_id: InterfaceId, _key_index: u8) -> Result<(), i32> {
+        Ok(())
+    }
+
     fn get_station(&mut self, _iface_id: InterfaceId, _mac: &[u8; 6]) -> Result<StationInfo, i32> {
+        Err(-38)
+    }
+
+    fn add_station(&mut self, _iface_id: InterfaceId, _mac: &[u8; 6]) -> Result<(), i32> {
+        Err(-38)
+    }
+
+    fn del_station(&mut self, _iface_id: InterfaceId, _sta_idx: u8) -> Result<(), i32> {
         Err(-38)
     }
 
@@ -121,6 +157,18 @@ impl WiphyOps for WiphyOpsStub {
     }
 
     fn get_tx_power(&mut self, _iface_id: InterfaceId) -> Result<i32, i32> {
+        Err(-38)
+    }
+
+    fn get_channel(&mut self, _iface_id: InterfaceId) -> Result<u8, i32> {
+        Err(-61)
+    }
+
+    fn set_power_mgmt(&mut self, _iface_id: InterfaceId, _enabled: bool) -> Result<(), i32> {
+        Ok(())
+    }
+
+    fn set_wiphy_params(&mut self, _rts: Option<i32>, _frag: Option<i32>) -> Result<(), i32> {
         Err(-38)
     }
 }

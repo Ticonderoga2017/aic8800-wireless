@@ -10,8 +10,9 @@
 
 mod backend;
 mod cis;
-mod mmc_impl;
 mod flow;
+pub mod irq;
+mod mmc_impl;
 mod ops;
 mod types;
 
@@ -33,10 +34,12 @@ pub use cis::{
 // AIC8800 SDIO 主机：基于 SG2002 SD1 的 CMD52/CMD53 实现
 pub use backend::Aic8800SdioHost;
 
-// 流程六函数
+// 流程六函数与 IPC 导出（供 FDRV 发送 LMAC 命令与注册 E2A 回调）
 pub use flow::{
     aicbsp_current_product_id, aicbsp_driver_fw_init, aicbsp_minimal_ipc_verify, aicbsp_power_on,
     aicbsp_sdio_exit, aicbsp_sdio_init, aicbsp_sdio_probe, aicbsp_sdio_release,
+    submit_cmd_tx_and_wait_tx_done, with_cmd_mgr, set_e2a_indication_cb, set_rx_data_indication_cb,
+    sdio_poll_rx_once, E2aIndicationCb, RxDataIndicationCb,
 };
 
 // mmc crate 实现（MmcHost / SdioFunc）及 SDIO 驱动注册

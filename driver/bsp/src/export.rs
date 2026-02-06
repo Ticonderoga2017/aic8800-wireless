@@ -44,3 +44,16 @@ pub struct AicBspInfo {
     pub chip_rev: u8,
     pub fwlog_en: bool,
 }
+
+impl AicBspInfo {
+    /// 用于静态初始化（const 上下文），与 Default::default() 同值
+    pub const fn default_const() -> Self {
+        Self {
+            cpmode: 0,
+            hwinfo_r: 0,
+            hwinfo: 0,
+            chip_rev: 0,
+            fwlog_en: false,
+        }
+    }
+}

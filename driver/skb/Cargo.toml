@@ -1,0 +1,7 @@
+[package]
+name = "skb"
+version = "0.1.0"
+edition = "2021"
+description = "Socket buffer (skb) 抽象，对应 LicheeRV aic8800 依赖的 linux/skbuff.h：包缓冲、put/pull/push/reserve、队列"
+
+[dependencies]

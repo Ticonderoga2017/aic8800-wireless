@@ -43,8 +43,8 @@ pub struct LmacMsgHeader {
     pub param_len: u16,
 }
 
-/// LMAC 消息最大长度（含 param）
-pub const LMAC_MSG_MAX_LEN: usize = 1024;
+/// LMAC 消息最大长度（含 param）。与 LicheeRV 一致：8801 BSP rwnx_plat_bin_fw_upload_android 每块 1024 字节，param = 8+1024 = 1032
+pub const LMAC_MSG_MAX_LEN: usize = 1032;
 
 /// A2E 消息：头 + 可变长 param，序列化后经 SDIO 发送
 #[derive(Debug, Clone)]
@@ -124,6 +124,56 @@ pub enum TaskId {
     Max,
 }
 
+/// LMAC_FIRST_MSG(task) = (task << 10)，与 lmac_msg.h 一致
+#[inline(always)]
+pub const fn lmac_first_msg(task: u8) -> u16 {
+    (task as u16) << 10
+}
+
+/// SCANU 任务消息 ID（TASK_SCANU = 4）
+pub const SCANU_START_REQ: u16 = lmac_first_msg(TaskId::Scanu as u8);
+pub const SCANU_START_CFM: u16 = SCANU_START_REQ + 1;
+pub const SCANU_RESULT_IND: u16 = SCANU_START_REQ + 3;
+
+/// SM 任务消息 ID（TASK_SM = 6）
+pub const SM_CONNECT_REQ: u16 = lmac_first_msg(TaskId::Sm as u8);
+pub const SM_CONNECT_CFM: u16 = SM_CONNECT_REQ + 1;
+pub const SM_CONNECT_IND: u16 = SM_CONNECT_REQ + 2;
+pub const SM_DISCONNECT_REQ: u16 = SM_CONNECT_REQ + 3;
+pub const SM_DISCONNECT_CFM: u16 = SM_CONNECT_REQ + 4;
+pub const SM_DISCONNECT_IND: u16 = SM_CONNECT_REQ + 5;
+
+/// MM 任务消息 ID（TASK_MM = 0），与 lmac_msg.h enum mm_msg_tag 对齐
+pub const MM_ADD_IF_REQ: u16 = lmac_first_msg(TaskId::Mm as u8) + 4;
+pub const MM_ADD_IF_CFM: u16 = MM_ADD_IF_REQ + 1;
+pub const MM_REMOVE_IF_REQ: u16 = lmac_first_msg(TaskId::Mm as u8) + 6;
+pub const MM_REMOVE_IF_CFM: u16 = MM_REMOVE_IF_REQ + 1;
+pub const MM_STA_ADD_REQ: u16 = lmac_first_msg(TaskId::Mm as u8) + 10;
+pub const MM_STA_ADD_CFM: u16 = MM_STA_ADD_REQ + 1;
+pub const MM_STA_DEL_REQ: u16 = lmac_first_msg(TaskId::Mm as u8) + 12;
+pub const MM_STA_DEL_CFM: u16 = MM_STA_DEL_REQ + 1;
+pub const MM_KEY_ADD_REQ: u16 = lmac_first_msg(TaskId::Mm as u8) + 72;
+pub const MM_KEY_ADD_CFM: u16 = MM_KEY_ADD_REQ + 1;
+pub const MM_KEY_DEL_REQ: u16 = MM_KEY_ADD_REQ + 2;
+pub const MM_KEY_DEL_CFM: u16 = MM_KEY_ADD_REQ + 3;
+/// 与 lmac_msg.h enum mm_msg_tag 一致：MM_SET_POWER_REQ 为第 46 项（RESET=0..ADD_IF=6..SET_POWER_REQ=46）
+pub const MM_SET_POWER_REQ: u16 = lmac_first_msg(TaskId::Mm as u8) + 46;
+pub const MM_SET_POWER_CFM: u16 = MM_SET_POWER_REQ + 1;
+/// MM_PS_CHANGE_IND（sta_idx, ps_state）、MM_RSSI_STATUS_IND（vif_index, rssi_status, rssi）
+pub const MM_PS_CHANGE_IND: u16 = lmac_first_msg(TaskId::Mm as u8) + 75;
+pub const MM_RSSI_STATUS_IND: u16 = lmac_first_msg(TaskId::Mm as u8) + 89;
+pub const MM_GET_STA_INFO_REQ: u16 = lmac_first_msg(TaskId::Mm as u8) + 368;
+pub const MM_GET_STA_INFO_CFM: u16 = MM_GET_STA_INFO_REQ + 1;
+
+/// APM 任务消息 ID（TASK_APM = 7）
+pub const APM_START_REQ: u16 = lmac_first_msg(TaskId::Apm as u8);
+pub const APM_START_CFM: u16 = APM_START_REQ + 1;
+pub const APM_STOP_REQ: u16 = APM_START_REQ + 2;
+pub const APM_STOP_CFM: u16 = APM_START_REQ + 3;
+
+/// 驱动侧任务 ID，对应 LicheeRV DRV_TASK_ID
+pub const DRV_TASK_ID: u16 = 100;
+
 /// 命令标志
 pub mod cmd_flags {
     pub const NONBLOCK: u16 = 1 << 0;
@@ -196,7 +246,7 @@ impl RwnxCmdMgr {
     /// RX 路径收到 E2A 确认时调用：根据 msg_id 匹配 reqid，写入 cfm 并标记 done；
     /// 并通知等待方（对齐 LicheeRV 的 complete(&cmd->complete)），使 wait_done 可立即返回。
     pub fn on_cfm(&mut self, msg_id: u16, param: &[u8]) {
-        for slot in self.slots.iter_mut() {
+        for (token, slot) in self.slots.iter_mut().enumerate() {
             if let Some(ref mut s) = *slot {
                 if s.reqid == msg_id && !s.done {
                     let len = param.len().min(RWNX_CMD_E2AMSG_LEN_MAX);
@@ -204,6 +254,9 @@ impl RwnxCmdMgr {
                     s.cfm_len = len;
                     s.done = true;
                     log::debug!(target: "wireless::bsp", "cmd_mgr on_cfm msg_id=0x{:04x} len={}", msg_id, len);
+                    if msg_id == 0x040b {
+                        log::info!(target: "wireless::bsp", "cmd_mgr on_cfm: DBG_MEM_BLOCK_WRITE_CFM 已匹配 token={} slot done", token);
+                    }
                     crate::sdio_irq::notify_wait_done();
                     crate::sdio_irq::notify_cmd_done(); // 中断式通知主线程：CFM 已到，可立即唤醒 wait_done_until
                     return;
@@ -287,17 +340,20 @@ impl RwnxCmdMgr {
     /// 等待直到 condition() 为 true 或超时。主线程在 CMD_DONE 队列上阻塞，由后台 busrx 在 on_cfm 时
     /// notify_cmd_done 唤醒。若提供 poll_fn 则每轮先执行（主线程每 1ms 主动收包，与 LicheeRV 一致）。
     /// 与 LicheeRV wait_for_completion_timeout(&cmd->complete) 对齐。
+    /// log_every_ms: None=每 500ms 打 "still waiting" 并调 tick；Some(100)=每 100ms，用于固件块写等待时打 F1 BLOCK_CNT。
     pub fn wait_done_until(
         timeout_ms: u32,
         mut condition: impl FnMut() -> bool,
         mut tick: Option<&mut dyn FnMut(u32)>,
         mut poll_fn: Option<&mut dyn FnMut()>,
+        log_every_ms: Option<u32>,
     ) -> Result<(), i32> {
         crate::sdio_irq::ensure_sdio_irq_registered();
         log::info!(target: "wireless::bsp", "cmd_mgr wait_done_until: block for CFM (timeout {}ms), busrx will notify on reply", timeout_ms);
         let mut waited_ms: u32 = 0;
         const POLL_INTERVAL_MS: u64 = 1;
-        const LOG_EVERY_MS: u32 = 500;
+        const DEFAULT_LOG_EVERY_MS: u32 = 500;
+        let log_every_ms = log_every_ms.unwrap_or(DEFAULT_LOG_EVERY_MS);
         let dur = core::time::Duration::from_millis(POLL_INTERVAL_MS);
         while waited_ms < timeout_ms {
             if let Some(ref mut pf) = poll_fn {
@@ -307,7 +363,7 @@ impl RwnxCmdMgr {
                 log::info!(target: "wireless::bsp", "cmd_mgr wait_done_until ok in {}ms", waited_ms);
                 return Ok(());
             }
-            if waited_ms > 0 && waited_ms % LOG_EVERY_MS == 0 {
+            if waited_ms > 0 && log_every_ms > 0 && waited_ms % log_every_ms == 0 {
                 log::warn!(target: "wireless::bsp", "cmd_mgr wait_done_until: still waiting for CFM, {}ms/{}ms", waited_ms, timeout_ms);
                 if let Some(ref mut t) = tick {
                     t(waited_ms);

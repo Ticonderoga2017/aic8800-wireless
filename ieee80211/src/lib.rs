@@ -22,5 +22,9 @@ pub use cfg80211::{
     KeyParams, KeyStatus, MgmtTxParams, Nl80211Iftype, ScanRequest, StationInfo, SurveyInfo,
     TxPowerSetting, WiphyParams,
 };
-pub use ieee80211::{Band, Channel, Rate, WlanEid};
+pub use ieee80211::{
+    Band, Channel, MacCipherSuite, Rate, WlanEid, wlan_cipher_suite, wlan_cipher_to_mac,
+    MAC_SEC_KEY_LEN,
+};
+pub use cfg80211::nl80211_sta_info;
 pub use mac80211::{Conf, Hw, HtCap, SupportedBand, TxqParams, VhtCap};

@@ -69,7 +69,11 @@ pub fn build_dbg_mem_read_req(mem_addr: u32) -> LmacMsg {
     msg
 }
 
-/// 从 DBG_MEM_READ_CFM 的 param 解析 memdata（param 前 8 字节：memaddr, memdata）
+/// 从 DBG_MEM_READ_CFM 的 param 解析 memdata（与 LicheeRV 布局一致时：param 为 [memaddr][memdata]）
+///
+/// **布局**：LicheeRV `struct dbg_mem_read_cfm { u32 memaddr; u32 memdata; }`，E2A 消息 param 为
+/// `[memaddr LE 4B][memdata LE 4B]`。部分 8801 bootrom 返回顺序为 **[memdata][memaddr]**，需用
+/// `parse_dbg_mem_read_cfm_with_addr(param, requested_addr)` 根据请求地址自动识别。
 pub fn parse_dbg_mem_read_cfm(param: &[u8]) -> Option<u32> {
     if param.len() < 8 {
         return None;
@@ -77,6 +81,33 @@ pub fn parse_dbg_mem_read_cfm(param: &[u8]) -> Option<u32> {
     let mut buf = [0u8; 4];
     buf.copy_from_slice(&param[4..8]);
     Some(u32::from_le_bytes(buf))
+}
+
+/// 解析 DBG_MEM_READ_CFM 的 memdata，根据请求地址自动识别 param 顺序（与 LicheeRV 差异修复）
+///
+/// 若 param 为 [memaddr][memdata]（LicheeRV 顺序），则第二 4 字节为 memdata；
+/// 若 8801 bootrom 返回 [memdata][memaddr]，则第二 4 字节等于 requested_addr，此时取第一 4 字节为 memdata。
+pub fn parse_dbg_mem_read_cfm_with_addr(param: &[u8], requested_addr: u32) -> Option<u32> {
+    let (first, second) = parse_dbg_mem_read_cfm_full(param)?;
+    let memdata = if second == requested_addr {
+        first
+    } else {
+        second
+    };
+    Some(memdata)
+}
+
+/// 解析 DBG_MEM_READ_CFM 的 memaddr 与 memdata（用于诊断日志，与 LicheeRV 布局一致）
+pub fn parse_dbg_mem_read_cfm_full(param: &[u8]) -> Option<(u32, u32)> {
+    if param.len() < 8 {
+        return None;
+    }
+    let mut a = [0u8; 4];
+    a.copy_from_slice(&param[0..4]);
+    let memaddr = u32::from_le_bytes(a);
+    a.copy_from_slice(&param[4..8]);
+    let memdata = u32::from_le_bytes(a);
+    Some((memaddr, memdata))
 }
 
 /// 构建 DBG_MEM_WRITE_REQ 消息（param: memaddr 4 + memdata 4）
@@ -121,7 +152,7 @@ where
     cmd_mgr.wait_done(token, timeout_ms, poll_fn, None)?;
     let mut cfm_buf = [0u8; 16];
     let len = cmd_mgr.take_cfm(token, &mut cfm_buf).ok_or(-5)?;
-    parse_dbg_mem_read_cfm(&cfm_buf[..len]).ok_or(-5)
+    parse_dbg_mem_read_cfm_with_addr(&cfm_buf[..len], mem_addr).ok_or(-5)
 }
 
 /// 发送 DBG_MEM_WRITE_REQ（不等待 CFM 内容，仅等待完成）
@@ -196,22 +227,30 @@ pub fn build_dbg_start_app_req(boot_addr: u32, boot_type: u32) -> LmacMsg {
     msg
 }
 
-/// 固件块上传：将 data 以 1KB 为单位写入设备 mem_addr，最后一块可不足 1KB
-/// tx_fn: 将序列化后的 LmacMsg 发送到总线；内部会通过 CmdMgr 等待 CFM
-pub fn fw_upload_blocks<F, E>(
-    cmd_mgr: &mut RwnxCmdMgr,
+/// 固件块上传：与 LicheeRV aic_bsp_driver.c rwnx_plat_bin_fw_upload_android 完全一致，每块 1024 字节，每块等待 DBG_MEM_BLOCK_WRITE_CFM。
+/// 每块：push_fn → tx_fn → wait_fn(token)，无“只发不等”。
+pub fn fw_upload_blocks<F, E, P, W>(
     mut tx_fn: F,
     mem_addr: u32,
     data: &[u8],
-    timeout_ms: u32,
-    poll_fn: &mut dyn FnMut(&mut RwnxCmdMgr),
+    mut push_fn: P,
+    mut wait_fn: W,
 ) -> Result<(), i32>
 where
     F: FnMut(&LmacMsg) -> Result<(), E>,
+    P: FnMut() -> Option<usize>,
+    W: FnMut(usize) -> Result<(), i32>,
 {
+    /// 与 LicheeRV 8801 BSP 一致：if (size > 1024) for (i = 0; i < (size - 1024); i += 1024) 每块 1KB
     const BLOCK: usize = 1024;
     let total_blocks = (data.len() + BLOCK - 1) / BLOCK;
-    log::info!(target: "wireless::bsp", "fw_upload_blocks: start addr=0x{:08x} len={} ({} blocks)", mem_addr, data.len(), total_blocks);
+    log::info!(
+        target: "wireless::bsp",
+        "fw_upload_blocks: start addr=0x{:08x} len={} ({} blocks)",
+        mem_addr,
+        data.len(),
+        total_blocks
+    );
     let mut addr = mem_addr;
     let mut off = 0;
     let mut block_index: usize = 0;
@@ -219,13 +258,12 @@ where
         let len = (data.len() - off).min(BLOCK);
         let block = &data[off..off + len];
         let msg = build_dbg_mem_block_write_req(addr, len as u32, block).ok_or(-12)?; // -ENOMEM
-        let token = cmd_mgr.push(DBG_MEM_BLOCK_WRITE_CFM).ok_or(-12)?;
+        let token = push_fn().ok_or(-12)?;
         tx_fn(&msg).map_err(|_| -5)?; // -EIO
-        cmd_mgr.wait_done(token, timeout_ms, &mut *poll_fn, None)?;
+        wait_fn(token)?;
         addr += len as u32;
         off += len;
         block_index += 1;
-        // 进度：每 32 块或 25%/50%/75%/100% 打一次，便于确认“第一个固件是否加载完”
         let pct = (off * 100) / data.len();
         if block_index % 32 == 0 || pct == 25 || pct == 50 || pct == 75 || off == data.len() {
             log::info!(target: "wireless::bsp", "fw_upload_blocks: progress block {}/{} ({}% done)", block_index, total_blocks, pct);

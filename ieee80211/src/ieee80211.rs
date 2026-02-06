@@ -155,3 +155,60 @@ pub fn is_probe_req(fc: u16) -> bool {
 pub fn is_action(fc: u16) -> bool {
     is_mgmt(fc) && (fc & 0x00F0) == fc::SUBTYPE_ACTION
 }
+
+// ========== 与 LicheeRV / Linux 对齐的常量 ==========
+// 对应 include/uapi/linux/nl80211.h WLAN_CIPHER_SUITE_*
+pub mod wlan_cipher_suite {
+    pub const WEP40: u32 = 0x000F_AC01;
+    pub const WEP104: u32 = 0x000F_AC05;
+    pub const TKIP: u32 = 0x000F_AC02;
+    pub const CCMP: u32 = 0x000F_AC04;
+    pub const AES_CMAC: u32 = 0x000F_AC06;
+    pub const GCMP: u32 = 0x000F_AC08;
+    pub const GCMP_256: u32 = 0x000F_AC09;
+    pub const CCMP_256: u32 = 0x000F_AC10;
+    pub const BIP_GMAC_128: u32 = 0x000F_AC0B;
+    pub const BIP_GMAC_256: u32 = 0x000F_AC0C;
+    pub const BIP_CMAC_256: u32 = 0x000F_AC0D;
+}
+
+/// 对应 lmac_mac.h enum mac_cipher_suite，与 rwnx_cfg80211_add_key 中 switch(params->cipher) 一致
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum MacCipherSuite {
+    Wep40 = 0,
+    Tkip = 1,
+    Ccmp = 2,
+    Wep104 = 3,
+    WpiSms4 = 4,
+    BipCmac128 = 5,
+    Gcmp128 = 6,
+    Gcmp256 = 7,
+    Ccmp256 = 8,
+    BipGmac128 = 9,
+    BipGmac256 = 10,
+    BipCmac256 = 11,
+    Invalid = 0xFF,
+}
+
+/// WLAN_CIPHER_SUITE_* -> MAC_CIPHER_*，与 rwnx_main.c rwnx_cfg80211_add_key 一致
+pub fn wlan_cipher_to_mac(cipher: u32) -> Option<MacCipherSuite> {
+    use wlan_cipher_suite::*;
+    match cipher {
+        WEP40 => Some(MacCipherSuite::Wep40),
+        WEP104 => Some(MacCipherSuite::Wep104),
+        TKIP => Some(MacCipherSuite::Tkip),
+        CCMP => Some(MacCipherSuite::Ccmp),
+        AES_CMAC => Some(MacCipherSuite::BipCmac128),
+        GCMP => Some(MacCipherSuite::Gcmp128),
+        GCMP_256 => Some(MacCipherSuite::Gcmp256),
+        CCMP_256 => Some(MacCipherSuite::Ccmp256),
+        BIP_GMAC_128 => Some(MacCipherSuite::BipGmac128),
+        BIP_GMAC_256 => Some(MacCipherSuite::BipGmac256),
+        BIP_CMAC_256 => Some(MacCipherSuite::BipCmac256),
+        _ => None,
+    }
+}
+
+/// MAC 密钥最大长度，与 lmac_mac.h MAC_SEC_KEY_LEN 一致
+pub const MAC_SEC_KEY_LEN: usize = 32;

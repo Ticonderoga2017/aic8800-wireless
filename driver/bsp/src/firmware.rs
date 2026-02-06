@@ -3,7 +3,10 @@
 
 use crate::ProductId;
 
-/// 芯片版本（对应 aic_bsp_driver.h enum chip_rev）
+/// 芯片版本（与 LicheeRV aic_bsp_driver.h enum chip_rev 数值完全一致）
+///
+/// 8801 读 0x40500000 得 memdata，chip_rev = (memdata >> 16) & 0xFF；
+/// LicheeRV 仅接受 U02(3)、U03(7)、U04(7)，U04 与 U03 同为 7。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ChipRev {
@@ -232,6 +235,7 @@ pub fn get_firmware_list(
     is_chip_id_h: bool,
 ) -> Option<&'static [AicBspFirmware; 2]> {
     match product_id {
+        // 与 LicheeRV aic_bsp_driver.c 2019-2027：8801 chip_rev=(memdata>>16) 无 mask，仅接受 3/7，否则 return -1
         ProductId::Aic8801 => {
             if chip_rev != ChipRev::U02 as u8 && chip_rev != ChipRev::U03 as u8 {
                 return None;

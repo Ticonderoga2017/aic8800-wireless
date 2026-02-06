@@ -5,11 +5,16 @@ edition = "2021"
 description = "AIC8800 WiFi BSP - 平台抽象层，对应LicheeRV-Nano-Build/aic8800_bsp"
 
 [features]
-# 启用后从 wireless/firmware 用 include_bytes! 嵌入 .bin，需先将 wifi-driver/firmware/*.bin 复制到该目录
-embed_firmware = []
+# 默认仅嵌入 8801 必需的两份固件（fmacfw.bin、fmacfw_patch.bin），需复制到 wireless/firmware/
+default = ["embed_firmware_8801"]
+# 仅 8801 两文件，便于默认从本地加载
+embed_firmware_8801 = []
+# 嵌入全部 .bin（需 wireless/firmware 下所有文件存在）
+embed_firmware = ["embed_firmware_8801"]
 
 [dependencies]
 mmc = { path = "../mmc" }
+skb = { path = "../skb" }
 axerrno = "0.2"
 axhal = { path = "../../../arceos/modules/axhal", features = ["irq"] }
 axtask = { path = "../../../arceos/modules/axtask", features = ["multitask"] }

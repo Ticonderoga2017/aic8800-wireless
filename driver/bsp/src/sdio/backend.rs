@@ -1181,25 +1181,25 @@ impl Aic8800SdioHost {
     }
 
     /// 块读：与 LicheeRV 一致，F1/F2 均用 CMD53（sdio_readsb），无 CMD52 分支。
+    /// 多块时每块使用同一 addr（与 write_block 一致：F1 RD_FIFO 为单地址 FIFO，设备内部推进）。
     ///
     /// # 参数
-    /// - `addr`: 完整 SDIO 起始地址（func*0x100 + offset）。
+    /// - `addr`: 完整 SDIO 起始地址（func*0x100 + offset），多块时每块都用此地址。
     /// - `buf`: 目标缓冲区，读入的字节数等于 `buf.len()`。
     pub fn read_block(&self, addr: u32, buf: &mut [u8]) -> Result<usize, i32> {
         let len = buf.len();
         if len == 0 {
             return Ok(0);
         }
-        // F1/F2：与 LicheeRV sdio_readsb 一致，仅 CMD53
         let mut pos = 0;
         while pos < len {
             let chunk = (len - pos).min(CMD53_MAX_BYTES);
             if chunk >= 4 {
-                self.cmd53_read_chunk(addr.wrapping_add(pos as u32), &mut buf[pos..], chunk)?;
+                self.cmd53_read_chunk(addr, &mut buf[pos..], chunk)?;
                 pos += chunk;
             } else {
                 for i in 0..chunk {
-                    buf[pos + i] = self.read_byte(addr.wrapping_add((pos + i) as u32))?;
+                    buf[pos + i] = self.read_byte(addr)?;
                 }
                 pos += chunk;
             }
@@ -1224,25 +1224,27 @@ impl Aic8800SdioHost {
     }
 
     /// 块写：与 LicheeRV 一致，F1/F2 均用 CMD53（sdio_writesb），无 CMD52 分支。
+    /// 多块时每块使用同一 addr：LicheeRV aicwf_sdio_send_pkt 为 sdio_writesb(func, wr_fifo_addr, buf, count)，
+    /// 即整段数据写入同一 FIFO 地址，主机端按块切分时每块仍写同一地址（FIFO 由设备内部推进），
+    /// 若用 addr+pos 则第二块会变成 0x107+512=0x307（F3）导致 DATA 错误。
     ///
     /// # 参数
-    /// - `addr`: 完整 SDIO 起始地址（func*0x100 + offset）。
+    /// - `addr`: 完整 SDIO 起始地址（func*0x100 + offset），多块时每块都用此地址。
     /// - `buf`: 要写入的数据缓冲区，写入字节数等于 `buf.len()`。
     pub fn write_block(&self, addr: u32, buf: &[u8]) -> Result<usize, i32> {
         let len = buf.len();
         if len == 0 {
             return Ok(0);
         }
-        // F1/F2：与 LicheeRV sdio_writesb（含 aicwf_sdio_send_msg F2 0x207）一致，仅 CMD53
         let mut pos = 0;
         while pos < len {
             let chunk = (len - pos).min(CMD53_MAX_BYTES);
             if chunk >= 4 {
-                self.cmd53_write_chunk(addr.wrapping_add(pos as u32), &buf[pos..], chunk)?;
+                self.cmd53_write_chunk(addr, &buf[pos..], chunk)?;
                 pos += chunk;
             } else {
                 for i in 0..chunk {
-                    self.write_byte(addr.wrapping_add((pos + i) as u32), buf[pos + i])?;
+                    self.write_byte(addr, buf[pos + i])?;
                 }
                 pos += chunk;
             }
