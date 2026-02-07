@@ -1,0 +1,8 @@
+[package]
+name = "sdhci"
+version = "0.1.0"
+edition = "2021"
+description = "DMA 缓冲区分配，供 SDIO 等大块传输使用，对齐 LicheeRV host DMA"
+
+[dependencies]
+spin = { version = "0.9", default-features = false, features = ["mutex"] }

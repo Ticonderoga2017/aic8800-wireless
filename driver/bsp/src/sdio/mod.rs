@@ -9,6 +9,7 @@
 //! - `flow` — SDIO 流程六函数
 
 mod backend;
+mod chip_ident;
 mod cis;
 mod flow;
 pub mod irq;
@@ -24,6 +25,9 @@ pub use types::{
 
 // AIC8800 设备接口（对照 aicsdio.c）
 pub use ops::{Aic8800Sdio, SdioOps};
+
+// LicheeRV 芯片识别完整流程（预检查 + chipmatch）
+pub use chip_ident::{aicwf_sdio_chipmatch, identify_chip_from_cis, is_known_aic_sdio};
 
 // FBR/CIS
 pub use cis::{

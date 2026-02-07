@@ -4,7 +4,7 @@
 //! 若 CIS 中无 CISTPL_MANFID 则通过 probe_chip_type 探测寄存器推断芯片型号；不默认 D80。
 
 use super::ops::SdioOps;
-use super::types::{chipmatch, ProductId};
+use super::types::ProductId;
 
 /// Function Basic Registers (FBR) 基址：function f 的 FBR 在地址 f*0x100
 #[inline(always)]
@@ -249,13 +249,9 @@ pub fn product_id_to_vid_did(pid: ProductId) -> (u16, u16) {
     }
 }
 
+/// 使用 LicheeRV 完整识别流程：预检查 + chipmatch，再执行 aicbsp_sdio_probe。
 pub fn probe_from_sdio_cis<O: SdioOps>(ops: &O, func_num: u8) -> Result<(), i32> {
-    let (vid, did) = read_vendor_device(ops, func_num)?;
-    let pid = chipmatch(vid, did).ok_or_else(|| {
-        log::error!(target: "wireless::bsp::sdio", "probe_from_sdio_cis: vid=0x{:04x} did=0x{:04x} 不在 chipmatch 表内，非本驱动支持的 AIC 卡", vid, did);
-        -2
-    })?;
-    log::info!(target: "wireless::bsp::sdio", "probe_from_sdio_cis: vid=0x{:04x} did=0x{:04x} -> {:?}", vid, did, pid);
+    let pid = super::chip_ident::identify_chip_from_cis(ops, func_num)?;
     super::flow::aicbsp_sdio_probe(pid);
     Ok(())
 }

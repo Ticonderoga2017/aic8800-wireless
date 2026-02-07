@@ -13,8 +13,8 @@ use spin::Once;
 
 use axhal::irq::register as irq_register;
 
-/// SG2002 SD1 在 PLIC 上的外设中断号（DTS cv-sd interrupts = <0x24 0x04>，0x24=36）
-const SD1_PLIC_IRQ: usize = 0x24;
+/// SG2002 SD1（WiFi SD）在 PLIC 上的外设中断号。DTS：wifi-sd@4320000 interrupts = <38>；cv-sd@4310000 为 36，本 BSP 使用 0x4320000 故用 38。
+const SD1_PLIC_IRQ: usize = 38;
 
 /// 定时器驱动模式下，替代 SDIO IRQ 的轮询周期（毫秒）。与 LicheeRV 的 process_rxframes 调用频率对齐。
 pub const SDIO_TIMER_POLL_INTERVAL_MS: u64 = 1;

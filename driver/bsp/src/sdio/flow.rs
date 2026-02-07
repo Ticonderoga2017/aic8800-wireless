@@ -44,13 +44,48 @@ static BUSRX_RUNNING: AtomicBool = AtomicBool::new(false);
 static BUSTX_RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// 待发送的 CMD 消息（LicheeRV tx_priv->cmd_buf/cmd_len/cmd_txstate），bustx 线程取走后执行 send_msg
-const PENDING_CMD_TX_CAP: usize = 512;
+/// 主线程只写 payload_len 字节（如 24），bustx 内照抄 aicwf_sdio_tx_msg 做 align+TAIL+512
+/// 与 LicheeRV CMD_BUF_MAX 对齐：须容纳 DBG_MEM_BLOCK_WRITE_REQ 整包（16+1032=1048，向上取整 1536）
+const PENDING_CMD_TX_CAP: usize = 1536;
 static PENDING_CMD_TX: Mutex<Option<([u8; PENDING_CMD_TX_CAP], usize)>> = Mutex::new(None);
 /// bustx 完成 send_msg 后的结果（LicheeRV cmd_tx_succ），调用方 wait_tx_done 后取
 static TX_RESULT: Mutex<Option<i32>> = Mutex::new(None);
 
-/// IPC 接收缓冲区大小（8 字节头 + param）
-const IPC_RX_BUF_SIZE: usize = 8 + 256;
+/// 与 LicheeRV aicwf_sdio_tx_msg(aicsdio.c 953-978) 完全一致：在同一 buffer 上做 4 字节对齐、TAIL(4)、向上取整到 512，返回应发送长度。
+/// payload 为 cmd_buf，payload_len 为 cmd_len；写 pad 到 buf 中并返回 len（512 或 payload_len）。
+#[inline]
+fn aicwf_sdio_tx_msg_pad(buf: &mut [u8], payload_len: usize) -> usize {
+    const TX_ALIGNMENT: usize = 4;
+    const SDIOWIFI_FUNC_BLOCKSIZE: usize = 512;
+    const TAIL_LEN: usize = 4;
+    let mut len = payload_len;
+    // if ((len % TX_ALIGNMENT) != 0) { adjust_len = roundup(len, TX_ALIGNMENT); memcpy(payload+payload_len, adjust_str, ...); payload_len += ... }
+    if len % TX_ALIGNMENT != 0 {
+        let adjust_len = (len + TX_ALIGNMENT - 1) / TX_ALIGNMENT * TX_ALIGNMENT;
+        let need = adjust_len - len;
+        if buf.len() >= payload_len + need {
+            buf[payload_len..payload_len + need].fill(0);
+        }
+        len = adjust_len;
+    }
+    // link tail is necessary
+    let send_len = if len % SDIOWIFI_FUNC_BLOCKSIZE != 0 {
+        if buf.len() >= len + TAIL_LEN {
+            buf[len..len + TAIL_LEN].fill(0);
+        }
+        let payload_len_after_tail = len + TAIL_LEN;
+        (payload_len_after_tail / SDIOWIFI_FUNC_BLOCKSIZE + 1) * SDIOWIFI_FUNC_BLOCKSIZE
+    } else {
+        len
+    };
+    if send_len > len && buf.len() >= send_len {
+        buf[len..send_len].fill(0);
+    }
+    send_len
+}
+
+/// IPC 接收缓冲区大小。LicheeRV 按 block_cnt*512 读满整块以排空 RD_FIFO，否则芯片可能不响应下一包 IPC；故至少 512。
+const IPC_RX_BUF_SIZE: usize = 512;
 
 /// LicheeRV 8801 IPC 发送长度：与 aicwf_sdio_tx_msg 完全一致（aicsdio.c 964-978）
 /// 1) 先 4 字节对齐（TX_ALIGNMENT=4）；2) 未满 512 时加 TAIL_LEN(4) 再向上取整到 512。
@@ -111,17 +146,19 @@ pub fn set_rx_data_indication_cb(cb: RxDataIndicationCb) {
     *RX_DATA_INDICATION_CB.lock() = cb;
 }
 
+/// 与 LicheeRV aicsdio.h 一致：仅 SDIO_TYPE_CFG_CMD_RSP(0x11) 时调用 rwnx_rx_handle_msg → msgind → on_cfm
+const SDIO_TYPE_CFG_CMD_RSP: u8 = 0x11;
+
 /// 从 buf[offset..n] 解析一帧并 on_cfm；返回本帧长度（含头），无法解析返回 0
 ///
 /// 与 LicheeRV 一致：4B 前缀后为 `ipc_e2a_msg`，含 id/dest/src/param_len(8B) + **pattern(4B)** + param。
-/// param 从 offset+16 开始，否则会误把 pattern 当 param 首字导致 chip_rev 等解析错误（同板旧版读到 0x07、当前读到 0xde 的根因）。
-/// 同时：若已注册 E2A 指示回调，则对每条 E2A 消息调用（CFM 会先被 on_cfm 匹配，IND 由回调处理）。
+/// param 从 offset+16 开始。仅当 type&0x7f == SDIO_TYPE_CFG_CMD_RSP(0x11) 时调用 on_cfm（aicsdio_txrxif.c 213 行）。
 fn parse_one_cfm_at(buf: &[u8], n: usize, offset: usize, cmd_mgr: &mut RwnxCmdMgr) -> usize {
     if offset + 16 > n {
         return 0;
     }
     let type_bits = buf[offset + 2] & 0x7f;
-    if (0x10..=0x13).contains(&type_bits) {
+    if type_bits == SDIO_TYPE_CFG_CMD_RSP {
         let param_len = u16::from_le_bytes([buf[offset + 10], buf[offset + 11]]) as usize;
         if param_len <= 256 {
             let total = 16 + param_len; // 8B e2a header + 4B pattern + param（LicheeRV ipc_e2a_msg）
@@ -296,15 +333,20 @@ pub fn ensure_busrx_thread_started() {
     });
 }
 
-/// bustx 线程：wait(bustx_trgg) + tx_process，与 LicheeRV aicwf_sdio_bustx_thread 一致
+/// bustx 线程：wait(bustx_trgg) + tx_process，与 LicheeRV aicwf_sdio_bustx_thread 一致。
+/// LicheeRV 使用 wait_for_completion_interruptible(&bustx_trgg)，即无限等待；notify 时线程必须在队列上才能被唤醒。
+/// 若用短超时(1ms)+超时后 sleep(1ms)，则超时期间线程不在 BUSTX_WAIT_QUEUE，主线程 notify_bustx() 会丢失，导致 submit_cmd_tx 一直等不到 tx_done。
+/// 故此处用较长 wait 超时（如 60s），使线程绝大部分时间在队列上，主线程 notify 能可靠唤醒。
 fn bustx_thread_fn() {
-    const BUSTX_POLL_MS: u64 = 1;
+    const BUSTX_WAIT_MS: u64 = 60_000;
     while BUSTX_RUNNING.load(Ordering::Relaxed) {
-        let woken = !crate::sdio_irq::wait_bustx_or_timeout(core::time::Duration::from_millis(BUSTX_POLL_MS));
+        let woken = !crate::sdio_irq::wait_bustx_or_timeout(core::time::Duration::from_millis(BUSTX_WAIT_MS));
         if woken {
             let slot = PENDING_CMD_TX.lock().take();
-            if let Some((buf, len)) = slot {
-                let result = match with_sdio(|sdio| sdio.send_msg(&buf[..len], len)) {
+            if let Some((mut buf, payload_len)) = slot {
+                // 与 LicheeRV aicwf_sdio_tx_msg 一致：bustx 内在同一 buffer 上做 align+TAIL+512，再 flow_ctrl+send_pkt
+                let send_len = aicwf_sdio_tx_msg_pad(&mut buf, payload_len);
+                let result = match with_sdio(|sdio| sdio.send_msg(&buf[..send_len], send_len)) {
                     Some(Ok(_)) => 0,
                     Some(Err(e)) => e,
                     None => {
@@ -315,9 +357,6 @@ fn bustx_thread_fn() {
                 *TX_RESULT.lock() = Some(result);
                 crate::sdio_irq::notify_tx_done();
             }
-        }
-        if !woken {
-            axtask::sleep(core::time::Duration::from_millis(BUSTX_POLL_MS));
         }
     }
     log::debug!(target: "wireless::bsp::sdio", "bustx_thread exit");
@@ -346,6 +385,7 @@ pub fn submit_cmd_tx_and_wait_tx_done(buf: &[u8], len: usize) -> Result<(), i32>
         return Err(-22);
     }
     *TX_RESULT.lock() = None;
+    // 与 LicheeRV 一致：rwnx_set_cmd_tx 内 memset(buffer,0,CMD_BUF_MAX)，再填 [0..len]；此处整块零初始化后拷贝前 len 字节
     let mut arr = [0u8; PENDING_CMD_TX_CAP];
     arr[..len].copy_from_slice(buf);
     *PENDING_CMD_TX.lock() = Some((arr, len));
@@ -382,15 +422,8 @@ pub fn send_dbg_mem_read_busrx(mem_addr: u32, timeout_ms: u32, after_delay: Opti
     } else {
         msg.serialize(&mut buf)
     };
-    let send_len = if product_id == ProductId::Aic8801 {
-        ipc_send_len_8801(len)
-    } else {
-        len
-    };
-    if send_len > len {
-        buf[len..send_len].fill(0);
-    }
-    submit_cmd_tx_and_wait_tx_done(&buf[..send_len], send_len).map_err(|e| {
+    // 与 LicheeRV 一致：主线程只传 payload_len，bustx 内 aicwf_sdio_tx_msg_pad 做 align+TAIL+512
+    submit_cmd_tx_and_wait_tx_done(&buf[..len], len).map_err(|e| {
         log::warn!(target: "wireless::bsp", "dbg_mem_read_busrx: submit_cmd_tx (bustx) failed, err={}", e);
         e
     })?;
@@ -490,14 +523,11 @@ pub fn aicbsp_minimal_ipc_verify(stable_ms: u64) -> AxResult<()> {
     let msg = build_dbg_mem_read_req(CHIP_REV_MEM_ADDR);
     let mut buf = [0u8; 512];
     let len = msg.serialize_8801(&mut buf);
-    let send_len = ipc_send_len_8801(len);
-    if send_len > len {
-        buf[len..send_len].fill(0);
-    }
+    // 与 LicheeRV 一致：主线程只传 payload_len，bustx 内 aicwf_sdio_tx_msg_pad 做 TAIL+512
     log::info!(target: "wireless::bsp::sdio", "minimal_ipc_verify: IPC head 24B {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
         buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10], buf[11],
         buf[12], buf[13], buf[14], buf[15], buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23]);
-    if let Err(e) = submit_cmd_tx_and_wait_tx_done(&buf[..send_len], send_len) {
+    if let Err(e) = submit_cmd_tx_and_wait_tx_done(&buf[..len], len) {
         log::error!(target: "wireless::bsp::sdio", "aicbsp_minimal_ipc_verify: submit_cmd_tx (bustx) failed {}", e);
         return Err(AxError::BadState);
     }
@@ -650,11 +680,8 @@ pub fn aicbsp_sdio_init() -> AxResult<()> {
             log::error!(target: "wireless::bsp::sdio", "aicbsp_sdio_init: F1 BYTEMODE_ENABLE(0x11)=1 failed {}", e);
             AxError::BadState
         })?;
-        host.write_byte(f1_base + u32::from(reg::INTR_CONFIG), 0x07).map_err(|e| {
-            log::error!(target: "wireless::bsp::sdio", "aicbsp_sdio_init: F1 INTR_CONFIG(0x04)=0x07 failed {}", e);
-            AxError::BadState
-        })?;
-        log::info!(target: "wireless::bsp::sdio", "aicbsp_sdio_init: Aic8801 F1 0x0B=1 0x11=1 0x04=0x07 in 1-bit (register_block, bytemode_enable, intr_config)");
+        // F1 INTR_CONFIG(0x04)=0x07 与 LicheeRV 一致在 bus_start 中、在 claim_irq 之后写入，见 driver_fw_init 内 enable_8801_sdio_intr
+        log::info!(target: "wireless::bsp::sdio", "aicbsp_sdio_init: Aic8801 F1 0x0B=1 0x11=1 in 1-bit (0x04=0x07 deferred to driver_fw_init after busrx+IRQ)");
     }
 
     // 3.5 与 LicheeRV 差异：本 SoC 上 4-bit 下 CMD52 均超时（INT_STS=0 inhibit_cmd=1），故 8801 在 init 内不切 4-bit，首包 IPC（FLOW_CTRL+WR_FIFO）在 1-bit 下完成；非 8801 仍按 Linux 顺序切 4-bit
@@ -718,6 +745,18 @@ pub fn aicbsp_sdio_init() -> AxResult<()> {
     // 6. 与 LicheeRV 一致：bustx 在 bus_init 里启动，首条 SDIO 命令由 bustx 发出（send_msg），避免 busrx 先轮询 CMD52 导致超时
     //    busrx 由调用方在“需要收包前”启动：minimal_verify 在 submit 后、aicbsp_driver_fw_init 在发首包前
     ensure_bustx_thread_started();
+
+    // 7. 与 LicheeRV 一致：bus_start（claim_irq + F1 INTR_CONFIG=0x07）在 probe 完成后、首包 IPC 前执行。
+    //    LicheeRV 在 aicwf_sdio_probe → bus_init → aicwf_bus_start 中完成；若此处不做，设备可能不对 MEM_WRITE 回 CFM（BLOCK_CNT 恒 0）。见 BLOCK_CNT流程与LicheeRV对照.md
+    if pid == ProductId::Aic8801 {
+        crate::sdio_irq::ensure_sdio_irq_registered();
+        let f1_intr = 0x100u32 + u32::from(super::types::reg::INTR_CONFIG);
+        if let Some(Err(e)) = with_sdio(|sdio| sdio.write_byte(f1_intr, 0x07)) {
+            log::warn!(target: "wireless::bsp::sdio", "aicbsp_sdio_init: Aic8801 F1 INTR_CONFIG(0x04)=0x07 failed {} (bus_start)", e);
+        } else {
+            log::info!(target: "wireless::bsp::sdio", "aicbsp_sdio_init: Aic8801 bus_start (claim_irq + F1 0x04=0x07) done, align LicheeRV");
+        }
+    }
 
     Ok(())
 }
@@ -942,6 +981,16 @@ pub fn aicbsp_driver_fw_init(info: &mut AicBspInfo) -> AxResult<()> {
     // 与 LicheeRV 对齐：先启动 bustx/busrx 线程，再发 IPC
     ensure_bustx_thread_started();
     ensure_busrx_thread_started();
+    // 8801：与 LicheeRV aicwf_sdio_bus_start 顺序一致 — 先 claim_irq 再写 F1 INTR_CONFIG(0x04)=0x07，避免中断已使能但 handler 未注册
+    if product_id == ProductId::Aic8801 {
+        crate::sdio_irq::ensure_sdio_irq_registered();
+        let f1_intr = 0x100u32 + u32::from(super::types::reg::INTR_CONFIG);
+        if let Some(Err(e)) = with_sdio(|sdio| sdio.write_byte(f1_intr, 0x07)) {
+            log::error!(target: "wireless::bsp::sdio", "aicbsp_driver_fw_init: F1 INTR_CONFIG(0x04)=0x07 failed {}", e);
+            return Err(AxError::BadState);
+        }
+        log::info!(target: "wireless::bsp::sdio", "aicbsp_driver_fw_init: Aic8801 F1 INTR_CONFIG(0x04)=0x07 (after busrx+IRQ, align LicheeRV bus_start)");
+    }
     // LicheeRV 上首包前有调度/中断延迟；给 bootrom 与 FLOW_CTRL 就绪时间，减少首包 submit_cmd_tx -110
     const POST_BUS_INIT_DELAY_MS: u64 = 200;
     axtask::sleep(core::time::Duration::from_millis(POST_BUS_INIT_DELAY_MS));
@@ -1025,15 +1074,23 @@ pub fn aicbsp_driver_fw_init(info: &mut AicBspInfo) -> AxResult<()> {
         if send_len > len {
             buf[len..send_len].fill(0);
         }
-        match with_sdio(|sdio| sdio.send_msg(&buf[..send_len], send_len)) {
-            Some(Ok(_)) => Ok(()),
-            Some(Err(e)) => {
-                log::warn!(target: "wireless::bsp::sdio", "tx_fn send_msg err={} (e.g. -110=FLOW_CTRL/-5=EIO)", e);
-                Err(e)
-            }
-            None => {
-                log::warn!(target: "wireless::bsp::sdio", "tx_fn with_sdio None (SDIO_DEVICE not set?)");
-                Err(-5)
+        // 8801 固件块写与 sysconfig 一致：经 bustx 发送（submit_cmd_tx_and_wait_tx_done），bustx 内 flow_ctrl+send_pkt，避免主线程直连 send_msg 时与 busrx 争用导致芯片未回 DBG_MEM_BLOCK_WRITE_CFM（BLOCK_CNT 恒 0）
+        if product_id == ProductId::Aic8801 {
+            submit_cmd_tx_and_wait_tx_done(&buf[..len], len).map_err(|e| {
+                log::warn!(target: "wireless::bsp::sdio", "tx_fn submit_cmd_tx (bustx) err={} (e.g. -110=FLOW_CTRL)", e);
+                e
+            })
+        } else {
+            match with_sdio(|sdio| sdio.send_msg(&buf[..send_len], send_len)) {
+                Some(Ok(_)) => Ok(()),
+                Some(Err(e)) => {
+                    log::warn!(target: "wireless::bsp::sdio", "tx_fn send_msg err={} (e.g. -110=FLOW_CTRL/-5=EIO)", e);
+                    Err(e)
+                }
+                None => {
+                    log::warn!(target: "wireless::bsp::sdio", "tx_fn with_sdio None (SDIO_DEVICE not set?)");
+                    Err(-5)
+                }
             }
         }
     };
@@ -1053,36 +1110,60 @@ pub fn aicbsp_driver_fw_init(info: &mut AicBspInfo) -> AxResult<()> {
     let fw = &fw_list[cpmode];
     log::info!(target: "wireless::bsp::sdio", "aicbsp_driver_fw_init: fw_list[{}] wl_fw={}", cpmode, fw.wl_fw);
 
-    // 2.5. 8801：aicbsp_system_config。与 LicheeRV 一致：每笔 DBG_MEM_WRITE 均等待 CFM，超时即失败，无只发不等。
-    // 时序：MEM_READ 与首笔 MEM_WRITE 之间加延时，给设备/bootrom 就绪时间（LicheeRV 上二者间有调度/线程切换自然间隔）。
+    // 2.5. 8801：aicbsp_system_config。与 LicheeRV 完全对齐：
+    // - 时序：LicheeRV 在 driver_fw_init 中 mem_read 返回后立即调用 aicbsp_system_config，无中间 delay。
+    // - 发送：经 bustx 线程写 WR_FIFO；收 CFM：仅 busrx+PLIC，主线程不传 poll_fn。
     if matches!(product_id, ProductId::Aic8801) {
-        const DELAY_BEFORE_SYS_CONFIG_MS: u64 = 150; // MEM_READ 完成后到首笔 MEM_WRITE 的间隔，可调大若仍无 CFM
-        log::info!(target: "wireless::bsp::sdio", "aicbsp_driver_fw_init: delay {}ms before step 2.5 (MEM_READ → first MEM_WRITE)", DELAY_BEFORE_SYS_CONFIG_MS);
-        axtask::sleep(core::time::Duration::from_millis(DELAY_BEFORE_SYS_CONFIG_MS));
         log::info!(target: "wireless::bsp::sdio", "aicbsp_driver_fw_init: step 2.5 aicbsp_system_config_8801");
         const SYS_CONFIG_CFM_WAIT_MS: u32 = 3000;
+        const SYS_CONFIG_LOG_EVERY_MS: u32 = 500;
+        let mut tick_sys_config = |waited_ms: u32| {
+            log_f1_block_cnt_flow_ctrl(waited_ms);
+        };
+        let mut syscfg_first_24b_log = false;
         let mut send_one = |addr: u32, data: u32| -> Result<(), i32> {
             let msg = build_dbg_mem_write_req(addr, data);
+            let mut buf = [0u8; PENDING_CMD_TX_CAP];
+            let len = msg.serialize_8801(&mut buf);
+            let send_len = ipc_send_len_8801(len);
+            if send_len > buf.len() {
+                return Err(-22);
+            }
+            const TAIL_LEN_SYS: usize = 4; // 与 LicheeRV aicwf_sdio_tx_msg TAIL_LEN 一致
+            if send_len > len {
+                buf[len..len + TAIL_LEN_SYS].fill(0);
+                if send_len > len + TAIL_LEN_SYS {
+                    buf[len + TAIL_LEN_SYS..send_len].fill(0);
+                }
+            }
             log::warn!(
                 target: "wireless::bsp",
                 "send_dbg_mem_write: id={} dest={} src={} param_len={} addr=0x{:08x} data=0x{:08x}",
                 msg.header.id, msg.header.dest_id, msg.header.src_id, msg.header.param_len,
                 addr, data
             );
+            if !syscfg_first_24b_log && send_len >= 24 {
+                syscfg_first_24b_log = true;
+                log::warn!(target: "wireless::bsp::sdio",
+                    "DBG_MEM_WRITE_REQ first 24B (LicheeRV rwnx_set_cmd_tx): {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+                    buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15], buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23]);
+            }
             let token = match with_cmd_mgr(|mgr| mgr.push(DBG_MEM_WRITE_CFM).ok_or(-12)) {
                 Some(Ok(t)) => t,
                 Some(Err(e)) => return Err(e),
                 None => return Err(-5),
             };
-            tx_fn(&msg)?;
+            submit_cmd_tx_and_wait_tx_done(&buf[..send_len], send_len)?;
             RwnxCmdMgr::wait_done_until(
                 SYS_CONFIG_CFM_WAIT_MS,
                 || with_cmd_mgr(|c| c.is_done(token)).unwrap_or(false),
+                Some(&mut tick_sys_config),
                 None,
-                None,
-                None,
+                Some(SYS_CONFIG_LOG_EVERY_MS),
             )
             .map_err(|_| -62)?;
+            // 与 LicheeRV 一致：wait 返回后释放 cmd 槽位（LicheeRV 在 rwnx_send_msg 返回前 kfree(cmd)），否则 10 条 syscfg 会占满 8 个 slot 导致第 9 次 push 返回 -ENOMEM(-12)
+            let _ = with_cmd_mgr(|c| c.take_cfm(token, &mut [0u8; 16]));
             axtask::sleep(core::time::Duration::from_millis(10));
             Ok(())
         };
@@ -1106,6 +1187,7 @@ pub fn aicbsp_driver_fw_init(info: &mut AicBspInfo) -> AxResult<()> {
     const BLOCK_WRITE_LOG_EVERY_MS: u32 = 100; // 等待 CFM 时每 100ms 打 F1 BLOCK_CNT/FLOW_CTRL 便于确认设备是否回包
     let mut block_wait_tick = |waited_ms: u32| log_f1_block_cnt_flow_ctrl(waited_ms);
     let mut push_fn = || with_cmd_mgr(|m| m.push(DBG_MEM_BLOCK_WRITE_CFM)).flatten();
+    let mut block_cfm_dummy = [0u8; 16];
     let mut wait_fn = |token: usize| {
         RwnxCmdMgr::wait_done_until(
             BLOCK_WRITE_CFM_TIMEOUT_MS,
@@ -1114,6 +1196,10 @@ pub fn aicbsp_driver_fw_init(info: &mut AicBspInfo) -> AxResult<()> {
             Some(&mut poll_impl),
             Some(BLOCK_WRITE_LOG_EVERY_MS),
         )
+        .map_err(|_| -62)?;
+        // 与 sysconfig 一致：wait 后 take_cfm 释放 slot，否则多块上传会占满 8 个 slot
+        let _ = with_cmd_mgr(|c| c.take_cfm(token, &mut block_cfm_dummy));
+        Ok(())
     };
     if let Some(data) = get_firmware_by_name(fw.wl_fw) {
         log::info!(target: "wireless::bsp::sdio", "aicbsp_driver_fw_init: step 3a wl_fw upload ({} bytes, {})", data.len(), fw.wl_fw);

@@ -11,10 +11,12 @@ const FUNC1_BASE: u32 = 0x100;
 const FUNC2_BASE: u32 = 0x200;
 /// 8800DC/DW send_msg 固定地址：Function 2 偏移 7（aicsdio.c aicwf_sdio_send_msg sdio_writesb(func_msg, 7, ...)）
 const FUNC2_MSG_ADDR_OFFSET: u32 = 7;
-/// Aic8801 发送前流控：F1 FLOW_CTRL(0x0A) & 0x7F > 此值才可发（LicheeRV aicwf_sdio_tx_msg：buffer_cnt > 0 且 len < buffer_cnt*BUFFER_SIZE）
-const FLOW_CTRL_THRESH: u8 = 2;
-/// 与 LicheeRV FLOW_CTRL_RETRY_COUNT(50) 一致，且递增延时（count<30: 1ms, 30..40: 1ms, 40..50: 10ms）
+/// Aic8801 发送前流控：与 LicheeRV aicwf_sdio_flow_ctrl 一致，fc_reg != 0 即通过（return ret=fc_reg），无 >thresh 判断
+const FLOW_CTRL_THRESH: u8 = 0; // LicheeRV: if (fc_reg != 0) return ret;
+/// 与 LicheeRV FLOW_CTRL_RETRY_COUNT(50) 一致；延时与 aicsdio.c 659-691 一致：count<30 udelay(200), 30..40 mdelay(1), 40..50 mdelay(10)
 const FLOW_CTRL_RETRY_COUNT: u32 = 50;
+/// 与 LicheeRV aicsdio.h BUFFER_SIZE(1536) 一致，用于 aicwf_sdio_tx_msg 条件 len < (buffer_cnt * BUFFER_SIZE)
+const BUFFER_SIZE: usize = 1536;
 
 /// AIC8800 SDIO 设备接口，与 aicwf_sdio_readb/writeb、send_pkt/recv_pkt、func2、send_msg 一一对应。
 /// FDRV 通过本 trait 访问 BSP 提供的 Aic8800Sdio 实现。
@@ -279,6 +281,7 @@ impl SdioOps for Aic8800Sdio {
             } else {
                 (block_cnt as usize) * BLOCKSIZE
             };
+            // 必须读满 data_len 以排空 RD_FIFO，否则芯片可能不响应下一包（LicheeRV 用 data_len 分配 skb 并读满）
             let read_len = min(n, data_len);
             log::info!(target: "wireless::bsp::sdio", "recv_pkt: F1 block_cnt(0x12)={} data_len={} read_len={}", block_cnt, data_len, read_len);
             return self.host.read_block(base, &mut buf[..read_len]);
@@ -297,21 +300,33 @@ impl SdioOps for Aic8800Sdio {
     /// 50 次重试、递增延时；未就绪则返回 -110 不写 WR_FIFO，避免 CMD53 超时。
     fn send_msg(&self, buf: &[u8], count: usize) -> Result<usize, i32> {
         let addr = if self.product_id == ProductId::Aic8801 {
-            // 与 LicheeRV aicwf_sdio_flow_ctrl 一致：fc_reg = read(FLOW_CTRL) & 0x7F；非 0 表示有缓冲；重试 50 次，延时递增（<30: 1ms, 30..40: 1ms, 40..50: 10ms）
-            let mut last_fc: u8 = 0;
-            for i in 0..FLOW_CTRL_RETRY_COUNT {
-                let fc = self.host.read_byte_at_func(1, reg::FLOW_CTRL as u32)?;
-                last_fc = fc & reg::FLOWCTRL_MASK;
-                if last_fc > FLOW_CTRL_THRESH {
+            // 与 LicheeRV aicwf_sdio_tx_msg(aicsdio.c 979-1001) 完全一致：buffer_cnt = flow_ctrl(); while ((buffer_cnt<=0 || (buffer_cnt>0 && len>buffer_cnt*BUFFER_SIZE)) && retry<10) { retry++; buffer_cnt = flow_ctrl(); }; 再判断 buffer_cnt>0 && len<(buffer_cnt*BUFFER_SIZE) 才 send_pkt
+            let mut buffer_cnt: i32 = 0;
+            for retry in 0..10u8 {
+                let mut last_fc: u8 = 0;
+                for i in 0..FLOW_CTRL_RETRY_COUNT {
+                    let fc = self.host.read_byte_at_func(1, reg::FLOW_CTRL as u32)?;
+                    last_fc = fc & reg::FLOWCTRL_MASK;
+                    if last_fc != 0 {
+                        break;
+                    }
+                    if i < 30 {
+                        crate::delay_spin_us(200);
+                    } else if i < 40 {
+                        axtask::sleep(core::time::Duration::from_millis(1));
+                    } else {
+                        axtask::sleep(core::time::Duration::from_millis(10));
+                    }
+                }
+                buffer_cnt = last_fc as i32;
+                if buffer_cnt > 0 && count < buffer_cnt as usize * BUFFER_SIZE {
                     break;
                 }
-                if i >= 40 {
-                    axtask::sleep(core::time::Duration::from_millis(10));
-                } else {
-                    axtask::sleep(core::time::Duration::from_millis(1));
+                if retry == 9 {
+                    return Err(-110);
                 }
             }
-            if last_fc <= FLOW_CTRL_THRESH {
+            if buffer_cnt <= 0 || count >= buffer_cnt as usize * BUFFER_SIZE {
                 return Err(-110);
             }
             FUNC1_BASE + u32::from(self.wr_fifo_offset)

@@ -111,13 +111,13 @@ pub enum SdioType {
 #[inline]
 pub fn chipmatch(vid: u16, did: u16) -> Option<ProductId> {
     use sdio_ids::*;
-    if vid == VENDOR_AIC8801 && did == DEVICE_AIC8801 {
+    if vid == VENDOR_AIC8801 && (did == DEVICE_AIC8801 || did == DEVICE_AIC8801_FUNC2) {
         return Some(ProductId::Aic8801);
     }
     if vid == VENDOR_AIC8800DC && did == DEVICE_AIC8800DC {
         return Some(ProductId::Aic8800Dc);
     }
-    if vid == VENDOR_AIC8800D80 && did == DEVICE_AIC8800D80 {
+    if vid == VENDOR_AIC8800D80 && (did == DEVICE_AIC8800D80 || did == DEVICE_AIC8800D80_FUNC2) {
         return Some(ProductId::Aic8800D80);
     }
     if vid == VENDOR_AIC8800D80X2 && did == DEVICE_AIC8800D80X2 {

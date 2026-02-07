@@ -6,5 +6,5 @@ description = "AIC8800 WiFi 全功能驱动 - 对应LicheeRV-Nano-Build/aic8800_
 
 [dependencies]
 bsp = { path = "../bsp" }
-ieee80211 = { path = "../../ieee80211" }
+ieee80211 = { path = "../../kernel/ieee80211" }
 log = { version = "0.4", default-features = false }

@@ -1,6 +1,4 @@
-//! 命令管理
-//! 对应 aic_bsp_driver.h 中的 rwnx_cmd_mgr
-//! 实现：命令队列、请求-确认配对、超时、on_cfm 回调
+//! 命令管理 — 原原本本照抄 LicheeRV aic_bsp_driver.c/h 中 rwnx_cmd_mgr、cmd_mgr_queue、cmd_mgr_msgind、cmd_complete
 
 /// IPC E2A 消息参数大小
 pub const IPC_E2A_MSG_PARAM_SIZE: usize = 256;
@@ -174,7 +172,7 @@ pub const APM_STOP_CFM: u16 = APM_START_REQ + 3;
 /// 驱动侧任务 ID，对应 LicheeRV DRV_TASK_ID
 pub const DRV_TASK_ID: u16 = 100;
 
-/// 命令标志
+/// 命令标志 — 与 aic_bsp_driver.h 完全一致
 pub mod cmd_flags {
     pub const NONBLOCK: u16 = 1 << 0;
     pub const REQ_CFM: u16 = 1 << 1;
@@ -184,15 +182,31 @@ pub mod cmd_flags {
     pub const DONE: u16 = 1 << 5;
 }
 
-/// 802.11 命令超时 (ms)
+/// RWNX_CMD_WAIT_COMPLETE(flags) — aic_bsp_driver.h: !(flags & (WAIT_ACK | WAIT_CFM))
+#[inline(always)]
+pub const fn rwnx_cmd_wait_complete(flags: u16) -> bool {
+    (flags & (cmd_flags::WAIT_ACK | cmd_flags::WAIT_CFM)) == 0
+}
+
+/// 802.11 命令超时 (ms) — aic_bsp_driver.h RWNX_80211_CMD_TIMEOUT_MS 6000
 pub const RWNX_80211_CMD_TIMEOUT_MS: u32 = 6000;
 
-/// 命令管理器最大挂起数
+/// 命令管理器最大挂起数 — RWNX_CMD_MAX_QUEUED 8
 const CMD_MGR_MAX_PENDING: usize = 8;
 
-/// 单条挂起命令
+/// 命令管理器状态 — aic_bsp_driver.h enum rwnx_cmd_mgr_state
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RwnxCmdMgrState {
+    Deinit = 0,
+    Inited = 1,
+    Crashed = 2,
+}
+
+/// 单条挂起命令 — 对应 struct rwnx_cmd（id/reqid/a2e_msg 由调用方在 push 时绑定，此处只存 reqid 与 cfm 结果）
 struct PendingCmd {
     reqid: u16,
+    flags: u16,
+    result: i32,
     done: bool,
     cfm_len: usize,
     cfm_data: [u8; RWNX_CMD_E2AMSG_LEN_MAX],
@@ -202,6 +216,8 @@ impl Default for PendingCmd {
     fn default() -> Self {
         Self {
             reqid: 0,
+            flags: 0,
+            result: -4, // -EINTR
             done: false,
             cfm_len: 0,
             cfm_data: [0; RWNX_CMD_E2AMSG_LEN_MAX],
@@ -209,60 +225,108 @@ impl Default for PendingCmd {
     }
 }
 
-/// 命令管理器：队列、请求-确认配对、超时
-/// 用法：push() 得到 token -> 平台调用 tx_fn 发送 msg -> RX 路径解析到 E2A 后调用 on_cfm -> wait_done(token, poll) 返回
+/// 命令管理器 — 照抄 aic_bsp_driver.h struct rwnx_cmd_mgr（state, lock, next_tkn, queue_sz, max_queue_sz, cmds）
 pub struct RwnxCmdMgr {
+    pub state: RwnxCmdMgrState,
+    next_tkn: u32,
+    /// 当前队列中的命令数，与 LicheeRV cmd_mgr->queue_sz 一致；超时用 RWNX_80211_CMD_TIMEOUT_MS * queue_sz
+    pub queue_sz: u32,
+    max_queue_sz: u32,
     slots: [Option<PendingCmd>; CMD_MGR_MAX_PENDING],
-    #[allow(dead_code)]
-    next_tkn: u16,
 }
 
 impl RwnxCmdMgr {
     pub const fn new() -> Self {
         Self {
-            slots: [None, None, None, None, None, None, None, None],
+            state: RwnxCmdMgrState::Inited,
             next_tkn: 0,
+            queue_sz: 0,
+            max_queue_sz: CMD_MGR_MAX_PENDING as u32,
+            slots: [None, None, None, None, None, None, None, None],
         }
     }
 
-    /// 登记一条需要确认的命令，返回 token（slot 下标）
+    /// cmd_mgr_queue 中“入队”部分：list_add_tail, queue_sz++；REQ_CFM 时 flags|=WAIT_CFM；result=-EINTR；返回 token。
+    /// 照抄 aic_bsp_driver.c cmd_mgr_queue 63-105 行。
     pub fn push(&mut self, reqid: u16) -> Option<usize> {
+        if self.state == RwnxCmdMgrState::Crashed {
+            log::error!(target: "wireless::bsp", "cmd queue crashed");
+            return None;
+        }
+        if self.queue_sz >= self.max_queue_sz {
+            log::error!(target: "wireless::bsp", "Too many cmds ({}) already queued", self.max_queue_sz);
+            return None;
+        }
         for (i, slot) in self.slots.iter_mut().enumerate() {
             if slot.is_none() {
-                log::debug!(target: "wireless::bsp", "cmd_mgr push reqid=0x{:04x} token={}", reqid, i);
+                let tkn = self.next_tkn;
+                self.next_tkn = self.next_tkn.wrapping_add(1);
+                let flags = cmd_flags::REQ_CFM | cmd_flags::WAIT_CFM; // reqcfm 时 flags |= REQ_CFM；queue 内 if REQ_CFM -> WAIT_CFM
                 *slot = Some(PendingCmd {
                     reqid,
+                    flags,
+                    result: -4, // -EINTR
                     done: false,
                     cfm_len: 0,
                     cfm_data: [0; RWNX_CMD_E2AMSG_LEN_MAX],
                 });
+                self.queue_sz += 1;
+                log::debug!(target: "wireless::bsp", "cmd_mgr push reqid=0x{:04x} token={} tkn={} queue_sz={}", reqid, i, tkn, self.queue_sz);
                 return Some(i);
             }
         }
-        log::warn!(target: "wireless::bsp", "cmd_mgr push: no free slot, reqid=0x{:04x}", reqid);
         None
     }
 
-    /// RX 路径收到 E2A 确认时调用：根据 msg_id 匹配 reqid，写入 cfm 并标记 done；
-    /// 并通知等待方（对齐 LicheeRV 的 complete(&cmd->complete)），使 wait_done 可立即返回。
+    /// cmd_mgr_msgind：匹配 reqid==msg->id 且 (flags & WAIT_CFM)；clear WAIT_CFM；cap param_len；memcpy(e2a_msg, param)；RWNX_CMD_WAIT_COMPLETE 则 cmd_complete。
+    /// 照抄 aic_bsp_driver.c cmd_mgr_msgind 156-194 行。
     pub fn on_cfm(&mut self, msg_id: u16, param: &[u8]) {
         for (token, slot) in self.slots.iter_mut().enumerate() {
             if let Some(ref mut s) = *slot {
-                if s.reqid == msg_id && !s.done {
-                    let len = param.len().min(RWNX_CMD_E2AMSG_LEN_MAX);
-                    s.cfm_data[..len].copy_from_slice(&param[..len]);
-                    s.cfm_len = len;
-                    s.done = true;
-                    log::debug!(target: "wireless::bsp", "cmd_mgr on_cfm msg_id=0x{:04x} len={}", msg_id, len);
-                    if msg_id == 0x040b {
-                        log::info!(target: "wireless::bsp", "cmd_mgr on_cfm: DBG_MEM_BLOCK_WRITE_CFM 已匹配 token={} slot done", token);
+                if s.reqid == msg_id && (s.flags & cmd_flags::WAIT_CFM) != 0 {
+                    s.flags &= !cmd_flags::WAIT_CFM;
+                    let mut param_len = param.len();
+                    if param_len > RWNX_CMD_E2AMSG_LEN_MAX {
+                        param_len = RWNX_CMD_E2AMSG_LEN_MAX;
                     }
-                    crate::sdio_irq::notify_wait_done();
-                    crate::sdio_irq::notify_cmd_done(); // 中断式通知主线程：CFM 已到，可立即唤醒 wait_done_until
+                    s.cfm_data[..param_len].copy_from_slice(&param[..param_len]);
+                    s.cfm_len = param_len;
+                    s.done = true;
+                    s.result = 0;
+                    log::debug!(target: "wireless::bsp", "cmd_mgr on_cfm msg_id=0x{:04x} len={} token={}", msg_id, param_len, token);
+                    if rwnx_cmd_wait_complete(s.flags) {
+                        self.cmd_complete(token);
+                    }
                     return;
                 }
             }
         }
+    }
+
+    /// cmd_complete：list_del, queue_sz--, flags|=DONE；若 RWNX_CMD_WAIT_COMPLETE 则 complete(&cmd->complete)。
+    /// 照抄 aic_bsp_driver.c cmd_complete 44-61 行。
+    fn cmd_complete(&mut self, token: usize) {
+        if token >= CMD_MGR_MAX_PENDING {
+            return;
+        }
+        if let Some(ref mut s) = self.slots[token] {
+            s.flags |= cmd_flags::DONE;
+            self.queue_sz = self.queue_sz.saturating_sub(1);
+            crate::sdio_irq::notify_wait_done();
+            crate::sdio_irq::notify_cmd_done();
+        }
+    }
+
+    /// 超时路径：与 LicheeRV queue() 内 wait_for_completion_killable_timeout 超时后 cmd_complete(cmd); state=CRASHED 一致。
+    pub fn complete_timeout(&mut self, token: usize) {
+        if token >= CMD_MGR_MAX_PENDING {
+            return;
+        }
+        if self.slots[token].take().is_some() {
+            self.queue_sz = self.queue_sz.saturating_sub(1);
+        }
+        self.state = RwnxCmdMgrState::Crashed;
+        log::warn!(target: "wireless::bsp", "cmd_mgr complete_timeout token={} queue_sz={}", token, self.queue_sz);
     }
 
     pub fn is_done(&self, token: usize) -> bool {
@@ -275,7 +339,7 @@ impl RwnxCmdMgr {
             .unwrap_or(false)
     }
 
-    /// 取走 cfm 数据并释放 slot
+    /// 取走 cfm 数据并释放 slot；queue_sz 已在 on_cfm -> cmd_complete 时减过，此处不再减
     pub fn take_cfm(&mut self, token: usize, out: &mut [u8]) -> Option<usize> {
         if token >= CMD_MGR_MAX_PENDING {
             return None;

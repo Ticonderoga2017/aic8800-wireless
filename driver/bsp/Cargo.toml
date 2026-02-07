@@ -13,8 +13,9 @@ embed_firmware_8801 = []
 embed_firmware = ["embed_firmware_8801"]
 
 [dependencies]
-mmc = { path = "../mmc" }
-skb = { path = "../skb" }
+sdhci = { path = "../../kernel/sdhci" }
+mmc = { path = "../../kernel/mmc" }
+skb = { path = "../../kernel/skb" }
 axerrno = "0.2"
 axhal = { path = "../../../arceos/modules/axhal", features = ["irq"] }
 axtask = { path = "../../../arceos/modules/axtask", features = ["multitask"] }
