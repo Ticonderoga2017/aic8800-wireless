@@ -29,27 +29,15 @@ impl MmcHost for BspSdioHost {
         flow::lock_sdio_device()
     }
 
+    /// 与 LicheeRV sdhci_set_ios 顺序一致：先 set_clock(ios->clock)（0=关卡时钟），再 set_bus_width(ios->bus_width)。
     fn set_ios(&self, ios: &MmcIos) -> Result<(), i32> {
         let guard = flow::lock_sdio_device();
         let sdio = guard.as_ref().ok_or(-19)?;
         let four_bit = matches!(ios.bus_width, MmcBusWidth::FourBit);
-        let freq_sel = if ios.clock > 0 {
-            Some(clock_to_freq_sel(ios.clock))
-        } else {
-            None
-        };
-        sdio.host().set_ios_raw(four_bit, freq_sel)
+        sdio.host().set_clock(ios.clock);
+        sdio.host().set_bus_width(four_bit);
+        Ok(())
     }
-}
-
-/// 将时钟 Hz 转为 SG2002 CLK_CTL FREQ_SEL(15:8) 分频值（近似）
-fn clock_to_freq_sel(clock_hz: u32) -> u8 {
-    const INT_CLK_HZ: u32 = 25_000_000;
-    if clock_hz >= INT_CLK_HZ / 2 {
-        return 0;
-    }
-    let div = (INT_CLK_HZ / (2 * clock_hz.max(1))).min(0xFF) as u8;
-    div
 }
 
 /// 通过 Aic8800Sdio 的 host 访问 F0（CCCR），供 mmc::sdio_enable_function 使用

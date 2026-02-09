@@ -203,18 +203,19 @@ fn parse_one_cfm_at(buf: &[u8], n: usize, offset: usize, cmd_mgr: &mut RwnxCmdMg
 /// 与 LicheeRV aicwf_process_rxframes 一致：一次 recv_pkt 可能读到多包，须循环解析直至无完整帧。
 /// 数据帧：(buf[2] & SDIO_TYPE_CFG) != SDIO_TYPE_CFG 时调用 set_rx_data_indication_cb 注册的回调；
 /// 配置帧：0x10..0x13 走 parse_one_cfm_at（on_cfm + E2A 指示回调）。
-fn poll_rx_one(sdio: &dyn SdioOps, cmd_mgr: &mut RwnxCmdMgr) {
+/// 返回 Err(EAGAIN) 时调用方应释放锁并 wait_sdio_irq_work_done 后重试。
+fn poll_rx_one(sdio: &dyn SdioOps, cmd_mgr: &mut RwnxCmdMgr) -> Result<(), i32> {
     const SDIO_TYPE_CFG: u8 = 0x10;
     let mut skb = SkBuff::alloc(IPC_RX_BUF_SIZE);
     let n = match sdio.recv_pkt(skb.data_mut(), IPC_RX_BUF_SIZE as u32, 1) {
         Ok(s) => s,
         Err(e) => {
-            log::warn!(target: "wireless::bsp::sdio", "poll_rx_one: recv_pkt err={} (e.g. BUF_RRDY timeout)", e);
-            return;
+            log::warn!(target: "wireless::bsp::sdio", "poll_rx_one: recv_pkt err={} (e.g. BUF_RRDY timeout / EAGAIN)", e);
+            return Err(e);
         }
     };
     if n == 0 {
-        return;
+        return Ok(());
     }
     skb.set_len(n);
     let buf = skb.data();
@@ -250,6 +251,7 @@ fn poll_rx_one(sdio: &dyn SdioOps, cmd_mgr: &mut RwnxCmdMgr) {
         }
         offset += consumed;
     }
+    Ok(())
 }
 
 /// 在持有 SDIO_DEVICE 与 CMD_MGR 锁时执行 f，供 RX 线程与多线程 IPC 路径使用（短暂持锁）
@@ -292,7 +294,11 @@ pub fn sdio_poll_rx_once() {
     run_poll_rx_one();
 }
 
-/// RX 线程循环体：从 SDIO 收一包并解析、on_cfm（对齐 LicheeRV aicwf_process_rxframes）；锁顺序 CMD_MGR → SDIO_DEVICE 避免死锁
+const EAGAIN: i32 = -11;
+const IRQ_WORK_DONE_WAIT_MS_RX: u64 = 2000;
+
+/// RX 线程循环体：从 SDIO 收一包并解析、on_cfm（对齐 LicheeRV aicwf_process_rxframes）；锁顺序 CMD_MGR → SDIO_DEVICE 避免死锁。
+/// 若 poll_rx_one 返回 EAGAIN（CARD_INT 已入队），释放锁、等待 work 完成后再返回，下次 busrx 迭代重试。
 fn run_poll_rx_one() {
     let mut cmd_guard = CMD_MGR.lock();
     let cmd_mgr = match cmd_guard.as_mut() {
@@ -304,7 +310,15 @@ fn run_poll_rx_one() {
         Some(s) => s,
         None => return,
     };
-    poll_rx_one(sdio as &dyn SdioOps, cmd_mgr);
+    if let Err(e) = poll_rx_one(sdio as &dyn SdioOps, cmd_mgr) {
+        if e == EAGAIN {
+            drop(sdio_guard);
+            drop(cmd_guard);
+            let _ = crate::sdio_irq::wait_sdio_irq_work_done_timeout(
+                core::time::Duration::from_millis(IRQ_WORK_DONE_WAIT_MS_RX),
+            );
+        }
+    }
 }
 
 /// busrx 线程：wait(busrx_trgg 等价) + run_poll_rx_one，与 LicheeRV aicwf_sdio_busrx_thread 对齐
@@ -333,42 +347,74 @@ pub fn ensure_busrx_thread_started() {
     });
 }
 
+/// CARD_INT 排队 work 线程：与 LicheeRV sdio_irq.c sdio_irq_work 一致，异步执行 sdio_run_irqs（读 0x05 + ack）。
+/// 传输入口检测到 CARD_INT 时仅 signal+notify，不持锁等待；本线程被唤醒后持 SDIO_DEVICE 锁执行 run_irqs，再 notify_done。
+fn sdio_irq_work_thread_fn() {
+    const SDIO_IRQ_WORK_POLL_MS: u64 = 10;
+    while BUSTX_RUNNING.load(Ordering::Relaxed) {
+        let timed_out = crate::sdio_irq::wait_sdio_irq_work_or_timeout(
+            core::time::Duration::from_millis(SDIO_IRQ_WORK_POLL_MS),
+        );
+        if !timed_out {
+            let guard = lock_sdio_device();
+            if let Some(ref sdio) = *guard {
+                sdio.host().sdio_run_irqs();
+            }
+            drop(guard);
+            crate::sdio_irq::notify_sdio_irq_work_done();
+        }
+    }
+    log::debug!(target: "wireless::bsp::sdio", "sdio_irq_work_thread exit");
+}
+
 /// bustx 线程：wait(bustx_trgg) + tx_process，与 LicheeRV aicwf_sdio_bustx_thread 一致。
 /// LicheeRV 使用 wait_for_completion_interruptible(&bustx_trgg)，即无限等待；notify 时线程必须在队列上才能被唤醒。
 /// 若用短超时(1ms)+超时后 sleep(1ms)，则超时期间线程不在 BUSTX_WAIT_QUEUE，主线程 notify_bustx() 会丢失，导致 submit_cmd_tx 一直等不到 tx_done。
 /// 故此处用较长 wait 超时（如 60s），使线程绝大部分时间在队列上，主线程 notify 能可靠唤醒。
+/// EAGAIN(-11)：CARD_INT 已入队 work，释放锁后 wait_sdio_irq_work_done 再重试 send_msg。
 fn bustx_thread_fn() {
     const BUSTX_WAIT_MS: u64 = 60_000;
+    const EAGAIN: i32 = -11;
+    const IRQ_WORK_DONE_WAIT_MS: u64 = 2000;
     while BUSTX_RUNNING.load(Ordering::Relaxed) {
         let woken = !crate::sdio_irq::wait_bustx_or_timeout(core::time::Duration::from_millis(BUSTX_WAIT_MS));
         if woken {
             let slot = PENDING_CMD_TX.lock().take();
             if let Some((mut buf, payload_len)) = slot {
-                // 与 LicheeRV aicwf_sdio_tx_msg 一致：bustx 内在同一 buffer 上做 align+TAIL+512，再 flow_ctrl+send_pkt
                 let send_len = aicwf_sdio_tx_msg_pad(&mut buf, payload_len);
-                let result = match with_sdio(|sdio| sdio.send_msg(&buf[..send_len], send_len)) {
-                    Some(Ok(_)) => 0,
-                    Some(Err(e)) => e,
-                    None => {
-                        log::warn!(target: "wireless::bsp::sdio", "bustx: with_sdio returned None (SDIO_DEVICE not ready?), result=-5");
-                        -5
+                loop {
+                    let result = match with_sdio(|sdio| sdio.send_msg(&buf[..send_len], send_len)) {
+                        Some(Ok(_)) => 0,
+                        Some(Err(e)) => e,
+                        None => {
+                            log::warn!(target: "wireless::bsp::sdio", "bustx: with_sdio returned None (SDIO_DEVICE not ready?), result=-5");
+                            -5
+                        }
+                    };
+                    if result != EAGAIN {
+                        *TX_RESULT.lock() = Some(result);
+                        crate::sdio_irq::notify_tx_done();
+                        break;
                     }
-                };
-                *TX_RESULT.lock() = Some(result);
-                crate::sdio_irq::notify_tx_done();
+                    // CARD_INT 已入队，等待 worker 执行 sdio_run_irqs 后再重试
+                    let _ = crate::sdio_irq::wait_sdio_irq_work_done_timeout(
+                        core::time::Duration::from_millis(IRQ_WORK_DONE_WAIT_MS),
+                    );
+                }
             }
         }
     }
     log::debug!(target: "wireless::bsp::sdio", "bustx_thread exit");
 }
 
-/// 确保已启动 bustx 线程（仅启动一次，对齐 LicheeRV aicwf_bus_init 里 kthread_run(aicwf_sdio_bustx_thread)）
+/// 确保已启动 bustx 线程与 CARD_INT work 线程（仅启动一次，对齐 LicheeRV aicwf_sdio_bustx_thread + sdio_irq_work）
 pub fn ensure_bustx_thread_started() {
     static STARTED: Once<()> = Once::new();
     STARTED.call_once(|| {
         BUSTX_RUNNING.store(true, Ordering::Relaxed);
+        let _ = axtask::spawn(sdio_irq_work_thread_fn);
         let _ = axtask::spawn(bustx_thread_fn);
-        log::info!(target: "wireless::bsp::sdio", "bustx_thread started (align LicheeRV aicwf_sdio_bustx_thread)");
+        log::info!(target: "wireless::bsp::sdio", "bustx_thread + sdio_irq_work_thread started (align LicheeRV aicwf_sdio_bustx_thread + sdio_irq_work)");
         axtask::sleep(core::time::Duration::from_millis(1));
     });
 }
@@ -615,6 +661,13 @@ pub fn aicbsp_sdio_init() -> AxResult<()> {
 
     let present_sts = host.read_present_sts();
     log::info!(target: "wireless::bsp::sdio", "aicbsp_sdio_init: card enumerated, RCA=0x{:04x}, PRESENT_STS=0x{:08x}", rca, present_sts);
+
+    // 1.4 快模式与 LicheeRV 一致：sdio_enable_hs → mmc_set_timing(SD_HS) → mmc_set_clock(max) → [后文 enable_4bit_bus]
+    //     先写卡 CCCR 0x13 EHS，再 set_clock(25M)（主机侧 set_clock 内会置 HISPD）
+    if host.enable_sdio_high_speed().is_err() {
+        // 卡不支持或 CMD52 失败，继续用默认速率
+    }
+    host.set_clock(25_000_000);
 
     // 1.5 与 Linux 一致：首次 CMD52（读 CCCR）在 1-bit 下进行（sdio_card_init 已不在此前切 4-bit），无需长延时
     const POST_ENUM_DELAY_MS: u32 = 2;

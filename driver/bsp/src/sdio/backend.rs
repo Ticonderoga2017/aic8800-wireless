@@ -14,7 +14,7 @@
 //! ## CMD52/CMD53 参数与 Linux 一致
 //!
 //! - **CMD52**：arg = R/W(bit31) | fn<<28 | (raw) | addr<<9 | data_byte，与 mmc_io_rw_direct_host 一致。
-//! - **CMD53**：arg = R/W(bit31) | fn<<28 | incr_addr(bit26)=0 | addr<<9 | byte_count(9:0)，字节模式 blocks=0、
+//! - **CMD53**：arg 与 LicheeRV mmc_io_rw_extended 一致，经 sdio_ops::mmc_io_rw_extended_arg_byte/arg_block 构造；字节模式 blocks=0、
 //!   blksz=N 时 Linux 为 data.blksz=N、data.blocks=1；本实现 BLK_SIZE_AND_CNT 设为 1 块 × N 字节以对齐。
 //!
 //! ## 与 LicheeRV 逻辑一致
@@ -135,6 +135,9 @@ mod sdmmc_regs {
     pub const BLK_SIZE_AND_CNT: usize = 0x004;
     pub const ARGUMENT: usize = 0x008;
     pub const XFER_MODE_AND_CMD: usize = 0x00c;
+    /// 与 LicheeRV SDHCI 一致：0x0C=TRANSFER_MODE(16bit)、0x0E=COMMAND(16bit)。多块 SDMA 时先写 TRANSFER_MODE 再写 COMMAND，使内部状态机正确进入完成节点。
+    pub const TRANSFER_MODE: usize = 0x00c;
+    pub const COMMAND: usize = 0x00e;
     pub const RESP31_0: usize = 0x010;
     pub const RESP63_32: usize = 0x014;
     /// 数据端口，CMD53 时读写 FIFO
@@ -143,38 +146,82 @@ mod sdmmc_regs {
     pub const PRESENT_STS: usize = 0x024;
     /// 主机控制 1：LED(0)、DATA_WIDTH(1)、HI_SPEED(2)、DMA_SEL(4:3)、CARD_DET_TEST(6)、CARD_DET_SEL(7)
     pub const HOST_CTRL1: usize = 0x028;
+    /// 与 LicheeRV SDHCI_POWER_CONTROL(0x29) 一致：写 SDHCI_POWER_ON|voltage 上电
+    pub const POWER_CONTROL: usize = 0x029;
+    /// 与 LicheeRV SDHCI_BLOCK_GAP_CONTROL(0x2A) 一致
+    pub const BLOCK_GAP_CONTROL: usize = 0x02A;
+    /// 与 LicheeRV SDHCI_WAKE_UP_CONTROL(0x2B) 一致
+    pub const WAKE_UP_CONTROL: usize = 0x02B;
     /// 时钟与复位控制（TRM CLK_CTL_SWRST）：INT_CLK_EN(0)、INT_CLK_STABLE(1)、SD_CLK_EN(2)、FREQ_SEL(15:8)
     pub const CLK_CTL_SWRST: usize = 0x02c;
+    /// 与 LicheeRV SDHCI_TIMEOUT_CONTROL(0x2E) 一致：quirk BROKEN_TIMEOUT_VAL 时用 0x0E
+    pub const TIMEOUT_CONTROL: usize = 0x02E;
     /// 中断状态（与 LicheeRV SDHCI_INT_STATUS 语义一致，写回读出的值清除对应位）
     pub const NORM_AND_ERR_INT_STS: usize = 0x030;
     /// 中断状态使能
     pub const NORM_AND_ERR_INT_STS_EN: usize = 0x034;
     /// 中断信号使能
     pub const NORM_AND_ERR_INT_SIG_EN: usize = 0x038;
+    /// LicheeRV P_VENDOR_SPECIFIC_AREA：读出的低 12 位为 vendor 区相对基址偏移
+    pub const P_VENDOR_SPECIFIC_AREA: usize = 0x0E8;
+    /// Cvitek vendor 区内偏移（与 sdhci-cv181x.h 一致）：MSHC_CTRL+0x40=PHY_TX_RX_DLY，+0x4C=PHY_CONFIG
+    pub const VENDOR_PHY_TX_RX_DLY_OFF: usize = 0x40;
+    pub const VENDOR_PHY_CONFIG_OFF: usize = 0x4C;
 }
 
-/// R5 响应错误位（RESP63_32 高字节），任一位置位则失败
-const R5_ERROR_MASK: u32 = 0xEC00;
+/// R5 响应错误位（与 LicheeRV include/linux/mmc/sdio.h 一致，检查 RESP 时用）。
+/// R5 格式：resp[0] 低 32 位中 [23:16]= 状态（ERROR/OUT_OF_RANGE/INVALID_FUNCTION_NUMBER 等），[15:8]= 数据域。
+/// 错误只看 (resp>>16)&R5_ERROR_MASK；resp=0x00002000 表示高 16 位为 0（无错误）、数据域=0x20，非卡端报错（主机超时时可能已收到 R5）。
+const R5_ERROR_MASK: u32 = sdhci::sdhci::r5_error::R5_ERROR_MASK;
+/// SDIO CCCR 0x05：Function Interrupt Pending（LicheeRV sdio_get_pending_irqs 用 CMD52 读此寄存器应答卡中断，使 CARD_INT 释放）
+const SDIO_CCCR_INTX: u32 = 0x05;
 /// 与 LicheeRV linux/drivers/mmc/host/sdhci.h 一致的中断位（NORM_AND_ERR_INT_STS 与 SDHCI_INT_STATUS 同构）
+/// 与 LicheeRV sdhci.h 完全一致的 INT 位与掩码，用于 handle_sdhci_host_irq 与 Linux sdhci_irq/sdhci_data_irq 对齐
 mod sdhci_int {
-    // pub const INT_RESPONSE: u32 = 0x0000_0001;
+    pub const INT_RESPONSE: u32 = 0x0000_0001;
     pub const INT_DATA_END: u32 = 0x0000_0002;       // 数据阶段完成（成功）
-    // pub const INT_BLK_GAP: u32 = 0x0000_0004;
+    pub const INT_BLK_GAP: u32 = 0x0000_0004;
     pub const INT_DMA_END: u32 = 0x0000_0008;
-    // pub const INT_SPACE_AVAIL: u32 = 0x0000_0010;
-    // pub const INT_DATA_AVAIL: u32 = 0x0000_0020;
+    pub const INT_SPACE_AVAIL: u32 = 0x0000_0010;   // PIO 写空间可用
+    pub const INT_DATA_AVAIL: u32 = 0x0000_0020;    // PIO 读数据可用
+    pub const INT_RETUNE: u32 = 0x0000_1000;
     pub const INT_TIMEOUT: u32 = 0x0001_0000;       // 命令超时
     pub const INT_DATA_TIMEOUT: u32 = 0x0010_0000;
     pub const INT_DATA_CRC: u32 = 0x0020_0000;
     pub const INT_DATA_END_BIT: u32 = 0x0040_0000;
+    pub const INT_BUS_POWER: u32 = 0x0080_0000;
+    pub const INT_AUTO_CMD_ERR: u32 = 0x0100_0000;
     pub const INT_ADMA_ERROR: u32 = 0x0200_0000;   // sdhci_data_irq 中与 DATA_* 同组处理
-    // pub const INT_DATA_MASK: u32 = INT_DATA_END | INT_DMA_END | ...
+    pub const INT_CRC: u32 = 0x0002_0000;
+    pub const INT_END_BIT: u32 = 0x0004_0000;
+    pub const INT_INDEX: u32 = 0x0008_0000;
+
+    /// 与 sdhci.h SDHCI_INT_CMD_MASK 一致：清除/处理命令中断
+    pub const INT_CMD_MASK: u32 = INT_RESPONSE | INT_TIMEOUT | INT_CRC | INT_END_BIT | INT_INDEX | INT_AUTO_CMD_ERR;
+    /// 与 sdhci.h SDHCI_INT_DATA_MASK 一致：清除/处理数据中断（sdhci_irq 先 clear 再 sdhci_data_irq）
+    pub const INT_DATA_MASK: u32 = INT_DATA_END | INT_DMA_END | INT_DATA_AVAIL | INT_SPACE_AVAIL
+        | INT_DATA_TIMEOUT | INT_DATA_CRC | INT_DATA_END_BIT | INT_ADMA_ERROR | INT_BLK_GAP;
 }
+
+/// 与 LicheeRV sdhci_set_default_irqs 一致的默认 IER：INT_BUS_POWER | INT_DATA_END_BIT | INT_DATA_CRC | INT_DATA_TIMEOUT | INT_INDEX | INT_END_BIT | INT_CRC | INT_TIMEOUT | INT_DATA_END | INT_RESPONSE | INT_RETUNE
+const DEFAULT_IER: u32 = sdhci_int::INT_BUS_POWER
+    | sdhci_int::INT_DATA_END_BIT
+    | sdhci_int::INT_DATA_CRC
+    | sdhci_int::INT_DATA_TIMEOUT
+    | sdhci_int::INT_INDEX
+    | sdhci_int::INT_END_BIT
+    | sdhci_int::INT_CRC
+    | sdhci_int::INT_TIMEOUT
+    | sdhci_int::INT_DATA_END
+    | sdhci_int::INT_RESPONSE
+    | sdhci_int::INT_RETUNE;
 
 /// 轮询超时，防止死等（用于 wait_cmd_complete / wait_xfer_complete 等纯轮询）
 const CMD_POLL_TIMEOUT_US: u32 = 100_000;
 /// wait_not_inhibit 超时与步进（与 LicheeRV U-Boot sdhci.c 对齐：SDHCI_CMD_DEFAULT_TIMEOUT=100ms，每次 udelay(1000)=1ms）
 const WAIT_INHIBIT_TIMEOUT_MS: u32 = 100;
+/// CMD/DMA IRQ 等待超时（与 LicheeRV sdhci.c SDHCI_READ_STATUS_TIMEOUT=1000ms 对齐）；wait_cmd_complete_irq 的等待条件为「IRQ 中处理完 CMD 后 notify」，超时表示 1000ms 内未收到 notify
+const WAIT_CMD_DMA_IRQ_TIMEOUT_MS: u64 = 1000;
 const WAIT_INHIBIT_DELAY_MS: u32 = 1;
 /// CMD53 单次最大字节数（SDIO 规范）
 const CMD53_MAX_BYTES: usize = 512;
@@ -186,6 +233,163 @@ const CMD_INDEX_5: u32 = 5;   // IO_SEND_OP_COND
 const CMD_INDEX_7: u32 = 7;   // SELECT/DESELECT_CARD
 const CMD_INDEX_52: u32 = 52; // IO_RW_Direct
 const CMD_INDEX_53: u32 = 53; // IO_RW_Extended
+
+/// 与 LicheeRV drivers/mmc/host/sdhci.h SDHCI_INT_CARD_INT 一致
+const CARD_INT: u32 = 0x100;
+
+/// 与 LicheeRV host->sdio_irq_pending 等价：CARD_INT 发生后置 true，process_sdio_pending_irqs 内清 false
+static SDIO_IRQ_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+// ---------- 与 LicheeRV sdhci_irq 等价的 CMD/DATA 完成路径：IRQ 里读 INT_STATUS、清除、再 complete ----------
+use core::sync::atomic::Ordering;
+use axtask::WaitQueue;
+
+/// CMD53 多块 DMA 是否正在等待 CMD 完成（IRQ 里仅在此为 true 时对 CMD_CMPL 做 clear+notify）
+static HOST_TRANSFER_CMD_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// CMD53 多块 DMA 是否正在等待 DMA 完成
+static HOST_TRANSFER_DMA_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// DMA 流程与 LicheeRV sdhci_prepare_data + sdhci_data_irq 对齐：prepare 顺序为 DMA 上下文( base/total/bytes_xfered=0 ) → SDMA_SADDR → config_dma(HOST_CTRL) → set_transfer_irqs → set_block_info；IRQ 中 INT_DMA_END 按 dmastart+bytes_xfered 对齐下一 512KB 边界写回 SDMA_SA，仅在 INT_DATA_END 时 complete。
+static HOST_DMA_BASE_PHYS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static HOST_DMA_TOTAL: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static HOST_DMA_BYTES_XFERRED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static HOST_CMD_DONE_QUEUE: WaitQueue = WaitQueue::new();
+static HOST_DMA_DONE_QUEUE: WaitQueue = WaitQueue::new();
+/// IRQ 里写；wait 返回后读。0=成功，负=错误码
+static HOST_CMD_RESULT: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
+static HOST_DMA_RESULT: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
+
+/// 与 LicheeRV sdhci_irq 等价：读 INT_STATUS → 先清除 CMD/DATA/BUS_POWER（DMA 等待时 DATA 延后按位清除）→ 处理 CMD/DATA/BUS_POWER/RETUNE/CARD_INT → 清除 CARD_INT/RETUNE；循环至无状态或 max_loops。
+///
+/// **CMD 完成与 LicheeRV 对齐**（LicheeRV 轮询：do { stat=read(); if (stat&INT_ERROR) break; } while ((stat&mask)!=mask)；成功则 (stat&(ERROR|mask))==mask 后 cmd_done+clear(mask)，否则 ret=-1 再 clear_all）：
+/// - 清除顺序：**先** 写 INT_STATUS 清除 INT_CMD_MASK，**再** 根据本轮读到的 sts 写 result 并 notify（避免电平触发重复进中断，且用已读 sts 判结果）。
+/// - Result 优先级（与 LicheeRV “break on INT_ERROR” 一致）：INT_TIMEOUT → -110；INT_CRC → -84；INT_END_BIT → -74；INT_RESPONSE → 0；其它 → -5。INT_RESPONSE 与 INT_TIMEOUT 同现时按超时返回。
+/// - 写入与唤醒：先 HOST_CMD_RESULT.store(err)，再 HOST_TRANSFER_CMD_PENDING.store(false)，再 notify_one，保证 wait 端先读到 result 再被唤醒。
+/// 由 irq.rs 的 sdio_irq_handler 在每次 SD1 中断时调用。
+pub fn handle_sdhci_host_irq() {
+    use axhal::mem::{pa, phys_to_virt};
+    use sdhci_int::{INT_ADMA_ERROR, INT_CMD_MASK, INT_CRC, INT_DATA_CRC, INT_DATA_END, INT_DATA_END_BIT, INT_DATA_MASK, INT_DATA_TIMEOUT, INT_DMA_END, INT_END_BIT, INT_RESPONSE, INT_RETUNE, INT_TIMEOUT};
+    const MAX_IRQ_LOOPS: u32 = 16; // 与 LicheeRV sdhci_irq max_loops 一致
+    let base = phys_to_virt(pa!(SD1_PHYS_BASE)).as_usize();
+    let mut max_loops = MAX_IRQ_LOOPS;
+    unsafe {
+        loop {
+            let sts = core::ptr::read_volatile((base + sdmmc_regs::NORM_AND_ERR_INT_STS) as *const u32);
+            if sts == 0 || sts == 0xffff_ffff {
+                break;
+            }
+            log::trace!(target: "wireless::bsp::sdio", "handle_sdhci_host_irq: INT_STS=0x{:08x}", sts);
+
+            // 与 LicheeRV 一致：先清除 CMD/DATA/BUS_POWER（有 DMA 等待时不在此处清 DATA，留到 DATA 分支按 DMA_END/DATA_END 分别清除）
+            let mut clear_mask = sts & (INT_CMD_MASK | sdhci_int::INT_BUS_POWER);
+            if !HOST_TRANSFER_DMA_PENDING.load(Ordering::SeqCst) {
+                clear_mask |= sts & INT_DATA_MASK;
+            }
+            if clear_mask != 0 {
+                core::ptr::write_volatile((base + sdmmc_regs::NORM_AND_ERR_INT_STS) as *mut u32, clear_mask);
+            }
+
+            // CMD 完成：与 LicheeRV 一致，错误优先于 INT_RESPONSE（同现时按超时/错误返回）；上面已清除 INT_CMD_MASK，此处仅用已读 sts 写 result 并 notify
+            if (sts & INT_CMD_MASK) != 0 && HOST_TRANSFER_CMD_PENDING.load(Ordering::SeqCst) {
+                let err = if (sts & INT_TIMEOUT) != 0 {
+                    let r5 = core::ptr::read_volatile((base + sdmmc_regs::RESP31_0) as *const u32);
+                    log::warn!(target: "wireless::bsp::sdio", "handle_sdhci_host_irq: CMD TIMEOUT INT_STS=0x{:08x} R5(RESP31_0)=0x{:08x} (0x2000=data byte 0x20, not R5 error)", sts, r5);
+                    -110i32
+                } else if (sts & INT_CRC) != 0 {
+                    -84
+                } else if (sts & INT_END_BIT) != 0 {
+                    -74
+                } else if (sts & INT_RESPONSE) != 0 {
+                    0
+                } else {
+                    -5
+                };
+                HOST_CMD_RESULT.store(err, Ordering::SeqCst);
+                HOST_TRANSFER_CMD_PENDING.store(false, Ordering::SeqCst);
+                HOST_CMD_DONE_QUEUE.notify_one(true);
+            }
+
+            // DATA 完成：与 sdhci_data_irq 一致。先判 INT_DATA_END（成功；与 LicheeRV 一致，DATA_END 与 DATA_TIMEOUT 同现时以 DATA_END 为成功），再错误位，再 INT_DMA_END（只更新 SDMA_SA）。
+            if (sts & INT_DATA_MASK) != 0 && HOST_TRANSFER_DMA_PENDING.load(Ordering::SeqCst) {
+                let total = HOST_DMA_TOTAL.load(Ordering::SeqCst);
+                let base_phys = HOST_DMA_BASE_PHYS.load(Ordering::SeqCst);
+
+                if (sts & INT_DATA_END) != 0 {
+                    HOST_DMA_RESULT.store(0, Ordering::SeqCst);
+                    HOST_TRANSFER_DMA_PENDING.store(false, Ordering::SeqCst);
+                    core::ptr::write_volatile((base + sdmmc_regs::NORM_AND_ERR_INT_STS) as *mut u32, sts & INT_DATA_MASK);
+                    HOST_DMA_DONE_QUEUE.notify_one(true);
+                } else if (sts & INT_DATA_TIMEOUT) != 0 {
+                    HOST_DMA_RESULT.store(-110i32, Ordering::SeqCst);
+                    HOST_TRANSFER_DMA_PENDING.store(false, Ordering::SeqCst);
+                    core::ptr::write_volatile((base + sdmmc_regs::NORM_AND_ERR_INT_STS) as *mut u32, sts & INT_DATA_MASK);
+                    HOST_DMA_DONE_QUEUE.notify_one(true);
+                } else if (sts & INT_DATA_END_BIT) != 0 {
+                    HOST_DMA_RESULT.store(-84, Ordering::SeqCst);
+                    HOST_TRANSFER_DMA_PENDING.store(false, Ordering::SeqCst);
+                    core::ptr::write_volatile((base + sdmmc_regs::NORM_AND_ERR_INT_STS) as *mut u32, sts & INT_DATA_MASK);
+                    HOST_DMA_DONE_QUEUE.notify_one(true);
+                } else if (sts & INT_DATA_CRC) != 0 {
+                    HOST_DMA_RESULT.store(-84, Ordering::SeqCst);
+                    HOST_TRANSFER_DMA_PENDING.store(false, Ordering::SeqCst);
+                    core::ptr::write_volatile((base + sdmmc_regs::NORM_AND_ERR_INT_STS) as *mut u32, sts & INT_DATA_MASK);
+                    HOST_DMA_DONE_QUEUE.notify_one(true);
+                } else if (sts & INT_ADMA_ERROR) != 0 {
+                    HOST_DMA_RESULT.store(-5, Ordering::SeqCst);
+                    HOST_TRANSFER_DMA_PENDING.store(false, Ordering::SeqCst);
+                    core::ptr::write_volatile((base + sdmmc_regs::NORM_AND_ERR_INT_STS) as *mut u32, sts & INT_DATA_MASK);
+                    HOST_DMA_DONE_QUEUE.notify_one(true);
+                } else if (sts & INT_DMA_END) != 0 {
+                    // 与 LicheeRV sdhci_data_irq INT_DMA_END 完全一致：dmastart+bytes_xfered 对齐到下一 512KB 边界，写回 SDMA_SADDR；不信任硬件返回的 DMA 地址（与 kernel 注释一致）
+                    const SIZE: u32 = SDHCI_DEFAULT_BOUNDARY_SIZE as u32;
+                    let bytes_so_far = HOST_DMA_BYTES_XFERRED.load(Ordering::SeqCst);
+                    let dmanow = base_phys.wrapping_add(bytes_so_far as u32);
+                    let next = (dmanow & !(SIZE - 1)).wrapping_add(SIZE);
+                    let new_bytes = next.wrapping_sub(base_phys) as usize;
+                    HOST_DMA_BYTES_XFERRED.store(new_bytes, Ordering::SeqCst);
+                    if new_bytes < total {
+                        core::ptr::write_volatile((base + sdmmc_regs::SDMA_SADDR) as *mut u32, next);
+                    }
+                    core::ptr::write_volatile((base + sdmmc_regs::NORM_AND_ERR_INT_STS) as *mut u32, INT_DMA_END);
+                } else {
+                    HOST_DMA_RESULT.store(-5, Ordering::SeqCst);
+                    HOST_TRANSFER_DMA_PENDING.store(false, Ordering::SeqCst);
+                    core::ptr::write_volatile((base + sdmmc_regs::NORM_AND_ERR_INT_STS) as *mut u32, sts & INT_DATA_MASK);
+                    HOST_DMA_DONE_QUEUE.notify_one(true);
+                }
+            }
+
+            // BUS_POWER：与 LicheeRV 一致仅记录
+            if (sts & sdhci_int::INT_BUS_POWER) != 0 {
+                log::trace!(target: "wireless::bsp::sdio", "handle_sdhci_host_irq: INT_BUS_POWER");
+            }
+
+            // INT_RETUNE：与 LicheeRV mmc_retune_needed 对齐（SDIO 无调谐，仅清除）
+            // 在循环末统一清除 CARD_INT/RETUNE
+
+            // CARD_INT：与 LicheeRV 一致仅当 (intmask & CARD_INT) && (ier & CARD_INT) 时 disable → signal → notify
+            let ier = core::ptr::read_volatile((base + sdmmc_regs::NORM_AND_ERR_INT_STS_EN) as *const u32);
+            if (sts & CARD_INT) != 0 && (ier & CARD_INT) != 0 {
+                let sts_en = core::ptr::read_volatile((base + sdmmc_regs::NORM_AND_ERR_INT_STS_EN) as *const u32);
+                let sig_en = core::ptr::read_volatile((base + sdmmc_regs::NORM_AND_ERR_INT_SIG_EN) as *const u32);
+                core::ptr::write_volatile((base + sdmmc_regs::NORM_AND_ERR_INT_STS_EN) as *mut u32, sts_en & !CARD_INT);
+                core::ptr::write_volatile((base + sdmmc_regs::NORM_AND_ERR_INT_SIG_EN) as *mut u32, sig_en & !CARD_INT);
+                SDIO_IRQ_PENDING.store(true, Ordering::SeqCst);
+                super::irq::notify_sdio_irq_work();
+            }
+
+            // 与 LicheeRV 一致：清除已处理的 CARD_INT/RETUNE（首轮未写入 STATUS 的位）
+            let clear_after = (sts & CARD_INT) | (sts & INT_RETUNE);
+            if clear_after != 0 {
+                core::ptr::write_volatile((base + sdmmc_regs::NORM_AND_ERR_INT_STS) as *mut u32, clear_after);
+            }
+
+            max_loops -= 1;
+            if max_loops == 0 {
+                break;
+            }
+        }
+    }
+}
 
 // =============================================================================
 // CMD0：GO_IDLE_STATE，复位卡到 Idle 状态
@@ -281,6 +485,11 @@ const CMD53_WRITE_XFER_MODE: u32 = 0
     | (0 << 22)  // CMD_TYPE = 0 (Normal)
     | (CMD_INDEX_53 << 24);
 
+/// 与 LicheeRV sdhci.h 一致：Host SDMA buffer boundary，4K～512K 2 的幂；边界参数写入 BLOCK_SIZE 高 3 位。
+/// SDHCI_DEFAULT_BOUNDARY_SIZE = 512*1024；SDHCI_DEFAULT_BOUNDARY_ARG = ilog2(512*1024)-12 = 7；SDHCI_MAKE_BLKSZ(7, 512) = 0x7200。
+const SDHCI_DEFAULT_BOUNDARY_SIZE: usize = 512 * 1024;
+const SDHCI_BLOCK_SIZE_WORD: u32 = ((7u32 & 0x7) << 12) | (512 & 0xFFF); // 0x7200
+
 /// CMD53 块模式多块写：与 LicheeRV 一次 sdio_writesb(buf, 1536) 等价，一次 CMD53 传输多块（如 3×512），设备侧视为一条完整 IPC。
 /// TRM SDMA 流程要求 XFER_MODE 置位 DMA_ENABLE(bit0)，否则控制器按非 DMA 等待 BUF_WRDY，CMD_CMPL 不置位。
 const CMD53_WRITE_MULTI_XFER_MODE: u32 = 0
@@ -313,8 +522,9 @@ const CMD53_READ_MULTI_XFER_MODE: u32 = 0
 // AIC8800 SDIO 主机（唯一实现）
 // =============================================================================
 
-/// FREQ_SEL(15:8) 用于数据传输阶段：与 LicheeRV set_ios(clock) 一致，枚举时 400kHz、数据阶段提高。
-/// 使用 2（约 6.25MHz）避免部分 SoC 在 div=0 时首条 CMD52/CMD53 无响应；仍远快于 400kHz 避免 CMD53 超时。
+/// 内部卡时钟频率（Hz），用于 set_clock 分频计算。TRM: F_SD_CLK = F_INT_CARD_CLK / (2*divisor)。与 LicheeRV DTS src-frequency = 375000000、max-frequency = 25000000 一致。
+const INT_CARD_CLK_HZ: u32 = 375_000_000;
+/// 与 LicheeRV set_ios(clock) 一致：枚举阶段 400kHz，数据阶段 25MHz。
 pub const FREQ_SEL_DATA_RATE: u8 = 2;
 
 /// AIC8800 使用的 SDIO 主机：基于 SG2002 SD1，通过 CMD52/CMD53 访问 AIC8800 卡。
@@ -364,38 +574,85 @@ impl Aic8800SdioHost {
         Ok((host, rca))
     }
 
-    /// 使能 SDMMC 控制器接口时钟（TRM：CLK_CTL INT_CLK_EN → 等 INT_CLK_STABLE → SD_CLK_EN）；否则卡端无时钟，CMD 无响应 → -110。
+    /// 使能 SDMMC 控制器接口时钟（与 LicheeRV sdhci_set_ios → set_clock 顺序一致：reset → HOST_CTRL → IER → set_clock(init)）。
     fn enable_sd_interface_clock(&self) {
-        const INT_CLK_EN: u32 = 1 << 0;
-        const INT_CLK_STABLE: u32 = 1 << 1;
-        const SD_CLK_EN: u32 = 1 << 2;
-        const FREQ_SEL_MASK: u32 = 0xFF00; // bits 15:8
-        // 识别阶段用较低时钟，分频约 0x80（F_SD_CLK = F_INT/(2*divisor)）
-        const FREQ_SEL_INIT: u32 = 0x80 << 8;
-
-        // 1. 软复位整个控制器
+        // 1. 软复位整个控制器（与 LicheeRV sdhci_cvi_reset_helper + SDHCI_RESET_ALL 等价）
         self.reset_all();
 
-        // 2. 配置 HOST_CTRL1：强制卡检测（SDIO 模组无 CD 引脚）
-        // CARD_DET_TEST(6)=1 + CARD_DET_SEL(7)=1 → 强制认为卡存在
+        // 2. 与 LicheeRV sdhci_set_ios/sdhci_set_power 对齐：POWER_CONTROL 上电 3.3V；BLOCK_GAP/WAKE_UP 清 0；TIMEOUT 默认 0x0E（QUIRK_BROKEN_TIMEOUT_VAL）
+        const SDHCI_POWER_ON: u8 = 0x01;
+        const SDHCI_POWER_330: u8 = 0x0E;
+        unsafe {
+            self.write_reg_8(sdmmc_regs::POWER_CONTROL, SDHCI_POWER_ON | SDHCI_POWER_330);
+            self.write_reg_8(sdmmc_regs::BLOCK_GAP_CONTROL, 0);
+            self.write_reg_8(sdmmc_regs::WAKE_UP_CONTROL, 0);
+            self.write_reg_8(sdmmc_regs::TIMEOUT_CONTROL, 0x0E);
+        }
+        log::debug!(target: "wireless::bsp::sdio", "POWER=0x{:02x} BLOCK_GAP=0 WAKE_UP=0 TIMEOUT=0x0E (align LicheeRV)", SDHCI_POWER_ON | SDHCI_POWER_330);
+
+        // 3. 配置 HOST_CTRL1：强制卡检测（SDIO 模组无 CD 引脚）
         const CARD_DET_TEST: u32 = 1 << 6;
         const CARD_DET_SEL: u32 = 1 << 7;
         let host_ctrl = unsafe { self.read_reg(sdmmc_regs::HOST_CTRL1) };
         unsafe { self.write_reg(sdmmc_regs::HOST_CTRL1, host_ctrl | CARD_DET_TEST | CARD_DET_SEL) };
         log::debug!(target: "wireless::bsp::sdio", "HOST_CTRL1: 0x{:08x} -> 0x{:08x} (force card detect)", host_ctrl, host_ctrl | CARD_DET_TEST | CARD_DET_SEL);
 
-        // 3. 使能中断状态位（否则 CMD_CMPL 等状态不会置位）
-        // 使能所有正常中断状态和错误中断状态
-        let int_en_before = unsafe { self.read_reg(sdmmc_regs::NORM_AND_ERR_INT_STS_EN) };
-        unsafe { self.write_reg(sdmmc_regs::NORM_AND_ERR_INT_STS_EN, 0xFFFF_FFFF) };
-        let int_en_after = unsafe { self.read_reg(sdmmc_regs::NORM_AND_ERR_INT_STS_EN) };
-        log::debug!(target: "wireless::bsp::sdio", "INT_STS_EN: 0x{:08x} -> 0x{:08x}", int_en_before, int_en_after);
+        // 4. 与 LicheeRV cv181x sdio reset 对齐：VENDOR MSHC_CTRL bit0|bit1|bit16；PHY 为 DS/HS（0x240=0x1000100，0x24c bit0=1）
+        {
+            let vendor_area = unsafe { self.read_reg(sdmmc_regs::P_VENDOR_SPECIFIC_AREA) };
+            let vendor_base = (vendor_area & 0xFFF) as usize;
+            let mshc_ctrl_offset = vendor_base;
+            const MSHC_BIT0: u32 = 1 << 0;  // EMMC_FUNC_EN
+            const MSHC_BIT1: u32 = 1 << 1;  // DS/HS setting
+            const MSHC_BIT16: u32 = 1 << 16; // for sd1
+            let ctrl = unsafe { self.read_reg(mshc_ctrl_offset) };
+            unsafe { self.write_reg(mshc_ctrl_offset, ctrl | MSHC_BIT0 | MSHC_BIT1 | MSHC_BIT16) };
+            let phy_dly_offset = vendor_base + sdmmc_regs::VENDOR_PHY_TX_RX_DLY_OFF;
+            let phy_config_offset = vendor_base + sdmmc_regs::VENDOR_PHY_CONFIG_OFF;
+            unsafe {
+                self.write_reg(phy_dly_offset, 0x1000100); // LicheeRV DS/HS: reg_0x240[25:24]=1 [22:16]=0 [9:8]=1 [6:0]=0
+                let cfg = self.read_reg(phy_config_offset);
+                self.write_reg(phy_config_offset, cfg | 1); // reg_0x24c[0]=1
+            }
+            log::info!(target: "wireless::bsp::sdio", "MSHC_CTRL(base+0x{:03x})=0x{:08x} PHY_DLY=0x1000100 PHY_CFG bit0=1 (SDIO SD1 DS/HS, align LicheeRV)", mshc_ctrl_offset, ctrl | MSHC_BIT0 | MSHC_BIT1 | MSHC_BIT16);
+        }
 
-        // 4. 配置时钟
+        // 5. 与 LicheeRV sdhci_set_default_irqs 一致：默认 IER 成对写入
+        unsafe {
+            self.write_reg(sdmmc_regs::NORM_AND_ERR_INT_STS_EN, DEFAULT_IER);
+            self.write_reg(sdmmc_regs::NORM_AND_ERR_INT_SIG_EN, DEFAULT_IER);
+        }
+        log::debug!(target: "wireless::bsp::sdio", "INT_STS_EN / INT_SIG_EN: DEFAULT_IER=0x{:08x}", DEFAULT_IER);
+
+        // 6. 与 LicheeRV set_ios(clock) → set_clock 一致：枚举阶段 400kHz
+        self.set_clock(400_000);
+    }
+
+    /// 设置 SD 总线时钟（与 LicheeRV host->ops->set_clock(host, ios->clock) 对齐）。
+    /// TRM: F_SD_CLK = F_INT_CARD_CLK / (2*divisor)，FREQ_SEL(15:8)=divisor。
+    /// - `clock_hz == 0`：关闭卡时钟（SD_CLK_EN=0），内部时钟保持。
+    /// - `clock_hz > 0`：计算 divisor，设 FREQ_SEL，开启 INT_CLK → 等 INT_CLK_STABLE → 开启 SD_CLK。
+    pub fn set_clock(&self, clock_hz: u32) {
+        const INT_CLK_EN: u32 = 1 << 0;
+        const INT_CLK_STABLE: u32 = 1 << 1;
+        const SD_CLK_EN: u32 = 1 << 2;
+        const FREQ_SEL_MASK: u32 = 0xFF00;
+
+        if clock_hz == 0 {
+            self.set_host_high_speed(false);
+            let ctl = unsafe { self.read_reg(sdmmc_regs::CLK_CTL_SWRST) };
+            unsafe { self.write_reg(sdmmc_regs::CLK_CTL_SWRST, ctl & !SD_CLK_EN) };
+            log::debug!(target: "wireless::bsp::sdio", "set_clock(0): SD_CLK_EN off");
+            return;
+        }
+
+        let divisor = (INT_CARD_CLK_HZ + 2 * clock_hz - 1) / (2 * clock_hz);
+        let divisor = divisor.clamp(1, 255);
+        let freq_sel = (divisor as u32) << 8;
+
         let mut ctl = unsafe { self.read_reg(sdmmc_regs::CLK_CTL_SWRST) };
-        ctl = (ctl & !FREQ_SEL_MASK) | FREQ_SEL_INIT;
-        unsafe { self.write_reg(sdmmc_regs::CLK_CTL_SWRST, ctl | INT_CLK_EN) };
-        // 给硬件若干周期稳定后再轮询 INT_CLK_STABLE
+        ctl = (ctl & !FREQ_SEL_MASK) | freq_sel | INT_CLK_EN;
+        unsafe { self.write_reg(sdmmc_regs::CLK_CTL_SWRST, ctl) };
         for _ in 0..1000 {
             core::hint::spin_loop();
         }
@@ -403,30 +660,47 @@ impl Aic8800SdioHost {
             let st = unsafe { self.read_reg(sdmmc_regs::CLK_CTL_SWRST) };
             if (st & INT_CLK_STABLE) != 0 {
                 unsafe { self.write_reg(sdmmc_regs::CLK_CTL_SWRST, st | SD_CLK_EN) };
-                let final_ctl = unsafe { self.read_reg(sdmmc_regs::CLK_CTL_SWRST) };
-                let freq_sel = (final_ctl >> 8) & 0xFF;
-                log::info!(target: "wireless::bsp::sdio", "SD1 clock: CLK_CTL=0x{:08x} FREQ_SEL(15:8)=0x{:02x} (init ~400kHz); INT_CLK+SD_CLK on", final_ctl, freq_sel);
+                self.set_host_high_speed(clock_hz >= 20_000_000);
+                let actual_hz = INT_CARD_CLK_HZ / (2 * divisor);
+                log::info!(target: "wireless::bsp::sdio", "set_clock: requested {} Hz -> divisor {} actual ~{} Hz (FREQ_SEL=0x{:02x})", clock_hz, divisor, actual_hz, divisor);
                 return;
             }
             core::hint::spin_loop();
         }
-        // 若 INT_CLK_STABLE 始终不置位仍尝试打开 SD_CLK_EN，部分平台需此才能通信
         let st = unsafe { self.read_reg(sdmmc_regs::CLK_CTL_SWRST) };
         unsafe { self.write_reg(sdmmc_regs::CLK_CTL_SWRST, st | SD_CLK_EN) };
-        let final_ctl = unsafe { self.read_reg(sdmmc_regs::CLK_CTL_SWRST) };
-        let freq_sel = (final_ctl >> 8) & 0xFF;
-        log::warn!(target: "wireless::bsp::sdio", "SD1 INT_CLK_STABLE did not assert; CLK_CTL=0x{:08x} FREQ_SEL=0x{:02x}, SD_CLK_EN set anyway", final_ctl, freq_sel);
+        self.set_host_high_speed(clock_hz >= 20_000_000);
+        log::warn!(target: "wireless::bsp::sdio", "set_clock: INT_CLK_STABLE did not assert; SD_CLK_EN set anyway, divisor={}", divisor);
     }
 
-    /// 软复位整个控制器（CLK_CTL_SWRST bit 24）
+    /// 主机侧高速使能（与 LicheeRV sdhci_set_ios 中 ios->timing==MMC_TIMING_SD_HS 时置 SDHCI_CTRL_HISPD 一致）。
+    fn set_host_high_speed(&self, enable: bool) {
+        const SDHCI_CTRL_HISPD: u32 = 1 << 2;
+        let ctrl = unsafe { self.read_reg(sdmmc_regs::HOST_CTRL1) };
+        let new_ctrl = if enable { ctrl | SDHCI_CTRL_HISPD } else { ctrl & !SDHCI_CTRL_HISPD };
+        if new_ctrl != ctrl {
+            unsafe { self.write_reg(sdmmc_regs::HOST_CTRL1, new_ctrl) };
+            log::debug!(target: "wireless::bsp::sdio", "set_host_high_speed: {} (HOST_CTRL1 HISPD)", enable);
+        }
+    }
+
+    /// 软复位整个控制器（与 LicheeRV sdhci_cvi_reset_helper + sdhci_reset(host, SDHCI_RESET_ALL) 对齐）。
+    /// TRM: CLK_CTL_SWRST bit24=SW_RST_ALL（等价 SDHCI 0x2F RESET_ALL）。流程：关 INT_STS_EN/INT_SIG_EN → 写 SW_RST_ALL → 等 bit 自清 → 恢复 DEFAULT_IER。
     fn reset_all(&self) {
         const SW_RST_ALL: u32 = 1 << 24;
+        unsafe {
+            self.write_reg(sdmmc_regs::NORM_AND_ERR_INT_STS_EN, 0);
+            self.write_reg(sdmmc_regs::NORM_AND_ERR_INT_SIG_EN, 0);
+        }
         unsafe { self.write_reg(sdmmc_regs::CLK_CTL_SWRST, SW_RST_ALL) };
-        // 等待复位完成（bit 自动清除）
         for _ in 0..100000 {
             let v = unsafe { self.read_reg(sdmmc_regs::CLK_CTL_SWRST) };
             if (v & SW_RST_ALL) == 0 {
                 log::debug!(target: "wireless::bsp::sdio", "reset_all: controller reset complete");
+                unsafe {
+                    self.write_reg(sdmmc_regs::NORM_AND_ERR_INT_STS_EN, DEFAULT_IER);
+                    self.write_reg(sdmmc_regs::NORM_AND_ERR_INT_SIG_EN, DEFAULT_IER);
+                }
                 return;
             }
             core::hint::spin_loop();
@@ -510,8 +784,36 @@ impl Aic8800SdioHost {
         Ok(rca)
     }
 
+    /// 设置主机总线位宽（与 LicheeRV sdhci_set_bus_width 对齐：SDHCI_HOST_CONTROL bit1 = SDHCI_CTRL_4BITBUS，即 HOST_CTRL1 bit1）。
+    pub fn set_bus_width(&self, width_4: bool) {
+        const DAT_XFER_WIDTH_4BIT: u32 = 1 << 1; // = SDHCI_CTRL_4BITBUS
+        let host_ctrl = unsafe { self.read_reg(sdmmc_regs::HOST_CTRL1) };
+        let new_ctrl = if width_4 {
+            host_ctrl | DAT_XFER_WIDTH_4BIT
+        } else {
+            host_ctrl & !DAT_XFER_WIDTH_4BIT
+        };
+        unsafe { self.write_reg(sdmmc_regs::HOST_CTRL1, new_ctrl) };
+        log::debug!(target: "wireless::bsp::sdio", "set_bus_width: {} (HOST_CTRL1 0x{:08x} -> 0x{:08x})", if width_4 { "4-bit" } else { "1-bit" }, host_ctrl, new_ctrl);
+    }
+
+    /// 使能 SDIO 卡高速模式（与 LicheeRV sdio_enable_hs → mmc_sdio_switch_hs 一致：CCCR 0x13 若支持 SHS 则置 EHS）。
+    /// 在切到 25MHz 前调用，与 LicheeRV 快模式顺序一致：enable_hs → set_timing(SD_HS) → set_clock(max) → enable_4bit_bus。
+    pub fn enable_sdio_high_speed(&self) -> Result<(), i32> {
+        const SDIO_CCCR_SPEED: u32 = 0x13;
+        const SDIO_SPEED_SHS: u8 = 0x01; // Supports High-Speed
+        const SDIO_SPEED_EHS: u8 = 0x02; // Enable High-Speed (SDR25)
+        let speed = self.read_byte(SDIO_CCCR_SPEED)?;
+        if (speed & SDIO_SPEED_SHS) == 0 {
+            return Ok(());
+        }
+        self.write_byte(SDIO_CCCR_SPEED, speed | SDIO_SPEED_EHS)?;
+        log::info!(target: "wireless::bsp::sdio", "enable_sdio_high_speed: CCCR 0x13 EHS set (align LicheeRV mmc_sdio_switch_hs)");
+        Ok(())
+    }
+
     /// 启用 4-bit 总线（与 Linux sdio_enable_4bit_bus → sdio_enable_wide + mmc_set_bus_width(4) 一致）。
-    /// 先写卡 CCCR_IF(0x07) 设 4-bit，再设 HOST_CTRL1。须在首次 CMD52（读 CCCR/使能 F1）完成后调用。
+    /// 先写卡 CCCR_IF(0x07)，再调 set_bus_width(4) 与 LicheeRV 顺序一致。
     pub fn enable_4bit_bus(&self) {
         const SDIO_CCCR_IF: u32 = 0x07;
         const SDIO_BUS_WIDTH_MASK: u8 = 0x03;
@@ -524,10 +826,8 @@ impl Aic8800SdioHost {
         } else {
             log::warn!(target: "wireless::bsp::sdio", "enable_4bit_bus: read CCCR_IF(0x07) failed");
         }
-        const DAT_XFER_WIDTH_4BIT: u32 = 1 << 1;
-        let host_ctrl = unsafe { self.read_reg(sdmmc_regs::HOST_CTRL1) };
-        unsafe { self.write_reg(sdmmc_regs::HOST_CTRL1, host_ctrl | DAT_XFER_WIDTH_4BIT) };
-        log::info!(target: "wireless::bsp::sdio", "enable_4bit_bus: CCCR_IF 4-bit + HOST_CTRL1 4-bit (align Linux sdio_enable_4bit_bus)");
+        self.set_bus_width(true);
+        log::info!(target: "wireless::bsp::sdio", "enable_4bit_bus: CCCR_IF 4-bit + set_bus_width(4) (align LicheeRV sdio_enable_4bit_bus)");
     }
 
     /// CMD0: GO_IDLE_STATE - 复位卡到 Idle 状态（无响应）
@@ -628,7 +928,7 @@ impl Aic8800SdioHost {
     /// - bit 23-0: OCR (Operating Conditions Register)
     fn cmd5_io_send_op_cond(&self, arg: u32) -> Result<u32, i32> {
         self.wait_not_inhibit()?;
-        self.clear_int_status(); // 与 U-Boot sdhci.c 一致：发命令前清掉上次的中断
+        // 与 LicheeRV 一致：不在发令前清 INT_STATUS，仅依赖轮询时按需清除
         let pre_int = unsafe { self.read_reg(sdmmc_regs::NORM_AND_ERR_INT_STS) };
         log::debug!(target: "wireless::bsp::sdio", "CMD5({:08x}) pre: INT_STS=0x{:08x}", arg, pre_int);
         
@@ -658,7 +958,7 @@ impl Aic8800SdioHost {
     /// 与 SD 卡不同，SDIO 卡自己生成 RCA 并通过 R6 响应返回。
     fn cmd3_send_relative_addr(&self) -> Result<u16, i32> {
         self.wait_not_inhibit()?;
-        self.clear_int_status();
+        // 与 LicheeRV 一致：不在发令前清 INT_STATUS
         unsafe {
             self.write_reg(sdmmc_regs::ARGUMENT, 0);
             self.write_reg(sdmmc_regs::XFER_MODE_AND_CMD, CMD3_XFER_MODE);
@@ -679,7 +979,7 @@ impl Aic8800SdioHost {
     ///（对照 LicheeRV：Linux MMC 栈在 CMD 完成后会等待 DAT 线空闲）。
     fn cmd7_select_card(&self, rca: u16) -> Result<(), i32> {
         self.wait_not_inhibit()?;
-        self.clear_int_status();
+        // 与 LicheeRV 一致：不在发令前清 INT_STATUS
         let arg = (rca as u32) << 16;
         unsafe {
             self.write_reg(sdmmc_regs::ARGUMENT, arg);
@@ -750,21 +1050,13 @@ impl Aic8800SdioHost {
         unsafe { self.read_reg(sdmmc_regs::PRESENT_STS) }
     }
 
-    /// 应用主机接口配置（对应 Linux host->ops->set_ios）。
-    /// 不依赖 mmc 类型，供 BSP 的 mmc::MmcHost::set_ios 调用。
-    /// - `four_bit`: 为 true 时启用 HOST_CTRL1 DAT_XFER_WIDTH（4-bit）
-    /// - `freq_sel`: 若为 Some(v)，设置 CLK_CTL FREQ_SEL(15:8)=v
+    /// 应用主机接口配置（对应 Linux host->ops->set_ios：clock + bus_width）。
+    /// - `four_bit`: 调用 set_bus_width(four_bit)
+    /// - `freq_sel`: 若为 Some(v)，设置 CLK_CTL FREQ_SEL(15:8)=v；若需按 Hz 设时钟请用 set_clock(clock_hz)
     pub fn set_ios_raw(&self, four_bit: bool, freq_sel: Option<u8>) -> Result<(), i32> {
-        const DAT_XFER_WIDTH_4BIT: u32 = 1 << 1;
-        const FREQ_SEL_MASK: u32 = 0xFF00;
-        let host_ctrl = unsafe { self.read_reg(sdmmc_regs::HOST_CTRL1) };
-        let host_ctrl_new = if four_bit {
-            host_ctrl | DAT_XFER_WIDTH_4BIT
-        } else {
-            host_ctrl & !DAT_XFER_WIDTH_4BIT
-        };
-        unsafe { self.write_reg(sdmmc_regs::HOST_CTRL1, host_ctrl_new) };
+        self.set_bus_width(four_bit);
         if let Some(v) = freq_sel {
+            const FREQ_SEL_MASK: u32 = 0xFF00;
             let ctl = unsafe { self.read_reg(sdmmc_regs::CLK_CTL_SWRST) };
             unsafe { self.write_reg(sdmmc_regs::CLK_CTL_SWRST, (ctl & !FREQ_SEL_MASK) | ((v as u32) << 8)) };
         }
@@ -779,6 +1071,18 @@ impl Aic8800SdioHost {
     #[inline]
     unsafe fn write_reg(&self, offset: usize, value: u32) {
         core::ptr::write_volatile((self.base_vaddr + offset) as *mut u32, value);
+    }
+
+    /// 8 位写，与 LicheeRV sdhci_writeb 对齐（POWER/BLOCK_GAP/WAKE_UP/TIMEOUT 等）
+    #[inline]
+    unsafe fn write_reg_8(&self, offset: usize, value: u8) {
+        core::ptr::write_volatile((self.base_vaddr + offset) as *mut u8, value);
+    }
+
+    /// 16 位写，用于 LicheeRV 对齐：先写 TRANSFER_MODE(0x0C) 再写 COMMAND(0x0E)。
+    #[inline]
+    unsafe fn write_reg_16(&self, offset: usize, value: u16) {
+        core::ptr::write_volatile((self.base_vaddr + offset) as *mut u16, value);
     }
 
     /// 等待可以发命令：PRESENT_STS 中 CMD_INHIBIT、CMD_INHIBIT_DAT 为 0。
@@ -990,15 +1294,134 @@ impl Aic8800SdioHost {
         Err(-110)
     }
 
-    /// 清除中断状态（发送新命令前必须调用）
+    /// 清除中断状态（发送新命令前必须调用）：写回已置位位清对应位（W1C）
     fn clear_int_status(&self) {
         unsafe {
-            // 写 1 清除所有已置位的中断状态
             let sts = self.read_reg(sdmmc_regs::NORM_AND_ERR_INT_STS);
             if sts != 0 {
                 self.write_reg(sdmmc_regs::NORM_AND_ERR_INT_STS, sts);
             }
         }
+    }
+
+    /// 等待 CMD 完成（IRQ 路径）：由 cmd53_*_blocks 在已设置 HOST_TRANSFER_CMD_PENDING 后调用。
+    /// 等待条件：被 handle_sdhci_host_irq 在检测到 INT_CMD_MASK 且 CMD_PENDING 时，在清除 INT_STATUS、写入 HOST_CMD_RESULT 后调用 notify_one 唤醒。
+    /// 超时时间：WAIT_CMD_DMA_IRQ_TIMEOUT_MS（1000ms），与 LicheeRV SDHCI_READ_STATUS_TIMEOUT 一致；超时后返回 Err(-110) 并清除 CMD_PENDING。
+    fn wait_cmd_complete_irq(&self) -> Result<(), i32> {
+        let dur = core::time::Duration::from_millis(WAIT_CMD_DMA_IRQ_TIMEOUT_MS);
+        let timed_out = HOST_CMD_DONE_QUEUE.wait_timeout(dur);
+        if timed_out {
+            log::error!(target: "wireless::bsp::sdio", "wait_cmd_complete_irq: timeout");
+            HOST_TRANSFER_CMD_PENDING.store(false, Ordering::SeqCst);
+            return Err(-110);
+        }
+        let r = HOST_CMD_RESULT.load(Ordering::SeqCst);
+        if r == 0 {
+            Ok(())
+        } else {
+            Err(r)
+        }
+    }
+
+    /// 等待 DMA 完成（IRQ 路径）：由 cmd53_*_blocks 在 CMD 完成后调用。等待条件：被 handle_sdhci_host_irq 在 DATA 分支（INT_DATA_END / INT_DATA_TIMEOUT / INT_DMA_END 等）处理并 notify_one 唤醒。超时同 WAIT_CMD_DMA_IRQ_TIMEOUT_MS。
+    fn wait_dma_complete_irq(&self) -> Result<(), i32> {
+        let dur = core::time::Duration::from_millis(WAIT_CMD_DMA_IRQ_TIMEOUT_MS);
+        let timed_out = HOST_DMA_DONE_QUEUE.wait_timeout(dur);
+        if timed_out {
+            log::error!(target: "wireless::bsp::sdio", "wait_dma_complete_irq: timeout");
+            HOST_TRANSFER_DMA_PENDING.store(false, Ordering::SeqCst);
+            return Err(-110);
+        }
+        let r = HOST_DMA_RESULT.load(Ordering::SeqCst);
+        if r == 0 {
+            Ok(())
+        } else {
+            Err(r)
+        }
+    }
+
+    /// 与 LicheeRV sdhci_set_transfer_irqs(DMA) 等价：关 PIO（DATA_AVAIL/SPACE_AVAIL），开 DMA_END|ADMA_ERROR，保留 DATA_END（整笔完成）；写 INT_ENABLE + SIGNAL_ENABLE。
+    fn set_transfer_irqs_dma(&self) {
+        use sdhci_int::{INT_ADMA_ERROR, INT_DATA_AVAIL, INT_DATA_END, INT_DMA_END, INT_SPACE_AVAIL};
+        const PIO_IRQS: u32 = INT_SPACE_AVAIL | INT_DATA_AVAIL;
+        const DMA_IRQS: u32 = INT_DMA_END | INT_DATA_END | INT_ADMA_ERROR; // LicheeRV dma_irqs = DMA_END|ADMA_ERROR，DATA_END 来自默认 ier
+        let ier = unsafe {
+            let current = self.read_reg(sdmmc_regs::NORM_AND_ERR_INT_STS_EN);
+            (current & !PIO_IRQS) | DMA_IRQS
+        };
+        unsafe {
+            self.write_reg(sdmmc_regs::NORM_AND_ERR_INT_STS_EN, ier);
+            self.write_reg(sdmmc_regs::NORM_AND_ERR_INT_SIG_EN, ier);
+        }
+    }
+
+    // ---------- 与 LicheeRV drivers/mmc/core/sdio_irq.c + host/sdhci.c 完全等价的 SDIO IRQ 路径 ----------
+
+    /// 与 LicheeRV sdio_get_pending_irqs 等价：CMD52 读 CCCR 0x05，返回 pending 字节（并应答卡中断）
+    fn sdio_get_pending_irqs(&self) -> Result<u8, i32> {
+        let pending = self.read_byte(SDIO_CCCR_INTX)?;
+        Ok(pending)
+    }
+
+    /// 与 LicheeRV sdhci_enable_sdio_irq_nolock 等价：使能/关闭 CARD_INT 在 INT_STS_EN 与 INT_SIG_EN 中的位
+    fn enable_sdio_irq(&self, enable: bool) {
+        let en = if enable { CARD_INT } else { 0 };
+        let sts_en = unsafe { self.read_reg(sdmmc_regs::NORM_AND_ERR_INT_STS_EN) };
+        let sig_en = unsafe { self.read_reg(sdmmc_regs::NORM_AND_ERR_INT_SIG_EN) };
+        unsafe {
+            self.write_reg(
+                sdmmc_regs::NORM_AND_ERR_INT_STS_EN,
+                (sts_en & !CARD_INT) | en,
+            );
+            self.write_reg(
+                sdmmc_regs::NORM_AND_ERR_INT_SIG_EN,
+                (sig_en & !CARD_INT) | en,
+            );
+        }
+    }
+
+    /// 与 LicheeRV process_sdio_pending_irqs 等价：清 sdio_irq_pending，读 0x05 取 pending，按 bit 调 function 中断（当前无注册 handler，仅读 0x05）
+    fn process_sdio_pending_irqs(&self) -> Result<(), i32> {
+        use core::sync::atomic::Ordering;
+        let _sdio_irq_pending = SDIO_IRQ_PENDING.swap(false, Ordering::SeqCst);
+        let int_before = unsafe { self.read_reg(sdmmc_regs::NORM_AND_ERR_INT_STS) };
+        let ret = self.sdio_get_pending_irqs();
+        let int_after = unsafe { self.read_reg(sdmmc_regs::NORM_AND_ERR_INT_STS) };
+        log::warn!(target: "wireless::bsp::sdio", "process_sdio_pending_irqs: CMD52读0x05 结果{:?} | INT_STS 读前=0x{:08x} 读后=0x{:08x} CARD_INT消失? {}",
+            ret, int_before, int_after, (int_after & CARD_INT) == 0);
+        ret?;
+        Ok(())
+    }
+
+    /// 与 LicheeRV host->ops->ack_sdio_irq 等价：重新使能 CARD_INT（读 0x05 后调用）
+    fn ack_sdio_irq(&self) {
+        self.enable_sdio_irq(true);
+    }
+
+    /// 与 LicheeRV sdio_run_irqs 等价：process_sdio_pending_irqs 后 ack_sdio_irq；由 sdio_irq_work 线程异步调用。
+    pub(crate) fn sdio_run_irqs(&self) {
+        let _ = self.process_sdio_pending_irqs();
+        if !SDIO_IRQ_PENDING.load(core::sync::atomic::Ordering::SeqCst) {
+            self.ack_sdio_irq();
+        }
+    }
+
+    /// 与 LicheeRV sdio_signal_irq 等价：置 sdio_irq_pending，在无 workqueue 时由调用方紧接着调用 sdio_run_irqs
+    fn sdio_signal_irq(&self) {
+        SDIO_IRQ_PENDING.store(true, core::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// 传输入口调用：若 CARD_INT 置位则仅 disable → signal → 入队 work（不在此处同步 run_irqs，与 LicheeRV sdio_signal_irq + queue_delayed_work 一致）。
+    /// 返回 true 表示已入队，调用方应释放锁、wait_sdio_irq_work_done_timeout 后重试；返回 false 表示无 CARD_INT，可继续传输。
+    fn process_sdio_pending_irqs_if_set(&self) -> bool {
+        let sts = unsafe { self.read_reg(sdmmc_regs::NORM_AND_ERR_INT_STS) };
+        if (sts & CARD_INT) != 0 {
+            self.enable_sdio_irq(false);
+            self.sdio_signal_irq();
+            super::irq::notify_sdio_irq_work();
+            return true;
+        }
+        false
     }
 
     /// CMD52 单字节读（指定 function）。
@@ -1008,7 +1431,7 @@ impl Aic8800SdioHost {
     /// - `reg`: 寄存器地址 (17 位)
     fn cmd52_read_func(&self, func: u32, reg: u32) -> Result<u8, i32> {
         self.wait_not_inhibit()?;
-        self.clear_int_status(); // 清除之前命令的中断状态
+        // 与 LicheeRV 一致：不在 send_command 开头清 INT_STATUS，在 IRQ/完成路径按需清除
         let arg = ((func & 7) << 28) | ((reg & 0x1_FFFF) << 9);
         unsafe {
             self.write_reg(sdmmc_regs::ARGUMENT, arg);
@@ -1027,7 +1450,7 @@ impl Aic8800SdioHost {
     /// CMD52 单字节写（指定 function）。
     fn cmd52_write_func(&self, func: u32, reg: u32, val: u8) -> Result<(), i32> {
         self.wait_not_inhibit()?;
-        self.clear_int_status(); // 清除之前命令的中断状态
+        // 与 LicheeRV 一致：不在 send_command 开头清 INT_STATUS，在 IRQ/完成路径按需清除
         let arg = (1 << 31) | ((func & 7) << 28) | ((reg & 0x1_FFFF) << 9) | (val as u32);
         unsafe {
             self.write_reg(sdmmc_regs::ARGUMENT, arg);
@@ -1069,10 +1492,13 @@ impl Aic8800SdioHost {
         let reg = addr & 0xFF;
         log::info!(target: "wireless::bsp::sdio", "cmd53_read: addr=0x{:03x} count={} (F{} reg=0x{:02x})", addr, count, func, reg);
         self.wait_not_inhibit()?;
-        self.clear_int_status(); // 清除之前命令的中断状态
-        // 与 Linux sdio_io_rw_ext_helper 一致：remainder 用 byte mode，mmc_io_rw_extended(blocks=0, blksz=size)；512 时 blocks=0, blksz=512 → arg 低 9 位=0
+        // 与 LicheeRV 一致：不在 send_command 开头清 INT_STATUS，在 IRQ/完成路径按需清除
+        if self.process_sdio_pending_irqs_if_set() {
+            return Err(-11); // EAGAIN：已入队 work，调用方释放锁并 wait_sdio_irq_work_done 后重试
+        }
+        // 与 LicheeRV mmc_io_rw_extended 一致：arg 用 mmc_io_rw_extended_arg_byte；地址为函数内偏移（与 kernel 传 addr 一致，F1/F2 即 reg）
         let n = count as u32;
-        let arg = (0 << 31) | (func << 28) | (0 << 27) | (0 << 26) | (reg << 9) | (if n == 512 { 0 } else { n });
+        let arg = sdhci::sdio_ops::mmc_io_rw_extended_arg_byte(false, func, reg, false, n);
         let blk_val: u32 = (1 << 16) | (count as u32);
         unsafe {
             self.write_reg(sdmmc_regs::BLK_SIZE_AND_CNT, blk_val);
@@ -1153,11 +1579,13 @@ impl Aic8800SdioHost {
         let reg = addr & 0xFF;
         log::info!(target: "wireless::bsp::sdio", "cmd53_write: addr=0x{:03x} count={} (F{} reg=0x{:02x})", addr, count, func, reg);
         self.wait_not_inhibit()?;
-        self.clear_int_status(); // 清除之前命令的中断状态
-        // addr = func*0x100 + offset；send_msg 等访问 F2 必须用正确 func，否则卡不响应、DATA_TIMEOUT
-        // 与 Linux sdio_io_rw_ext_helper 一致：remainder 用 byte mode，mmc_io_rw_extended(blocks=0, blksz=size)；512 时 blocks=0, blksz=512 → arg 低 9 位=0
+        // 与 LicheeRV 一致：不在 send_command 开头清 INT_STATUS，在 IRQ/完成路径按需清除
+        if self.process_sdio_pending_irqs_if_set() {
+            return Err(-11); // EAGAIN：已入队 work，调用方释放锁并 wait_sdio_irq_work_done 后重试
+        }
+        // 与 LicheeRV mmc_io_rw_extended 一致：arg 用 mmc_io_rw_extended_arg_byte；地址为函数内偏移（与 kernel 传 addr 一致，F1/F2 即 reg）
         let n = count as u32;
-        let arg = (1 << 31) | (func << 28) | (0 << 27) | (0 << 26) | (reg << 9) | (if n == 512 { 0 } else { n });
+        let arg = sdhci::sdio_ops::mmc_io_rw_extended_arg_byte(true, func, reg, false, n);
         let blk_val: u32 = (1 << 16) | (count as u32);
         unsafe {
             self.write_reg(sdmmc_regs::BLK_SIZE_AND_CNT, blk_val);
@@ -1228,12 +1656,9 @@ impl Aic8800SdioHost {
         Ok(())
     }
 
-    /// CMD53 块模式多块写：一次传输 N×512 字节（与 LicheeRV 一次 sdio_writesb(buf, N*512) 等价），仅使用 DMA（SDMA_SADDR + INT_DMA_END）。
+    /// CMD53 块模式多块写：一次 CMD53 传输 N×512 字节（与 LicheeRV mmc_io_rw_extended 单次请求一致），DMA 单缓冲。
     ///
-    /// # 参数
-    /// - `addr`: 完整 SDIO 地址（func*0x100 + offset），FIFO 固定地址。
-    /// - `buf`: 数据，长度必须 >= block_count * 512。
-    /// - `block_count`: 块数（1..=511），每块 512 字节，与 Linux mmc_io_rw_extended 一致。
+    /// 寄存器顺序与 LicheeRV sdhci_prepare_data + sdhci_send_command 一致：SDMA_SADDR → HOST_CTRL(DMA_SEL) → BLK_SIZE_AND_CNT → ARGUMENT → XFER_MODE_AND_CMD。
     fn cmd53_write_blocks(&self, addr: u32, buf: &[u8], block_count: u32) -> Result<(), i32> {
         const BLOCKSIZE: usize = 512;
         let count = (block_count as usize) * BLOCKSIZE;
@@ -1242,60 +1667,141 @@ impl Aic8800SdioHost {
         let reg = addr & 0xFF;
         log::info!(target: "wireless::bsp::sdio", "cmd53_write: addr=0x{:03x} blocks={} ({} bytes, F{} reg=0x{:02x})", addr, block_count, count, func, reg);
         self.wait_not_inhibit()?;
-        self.clear_int_status();
-
-        const HOST_CTRL1_DMA_SEL_MASK: u32 = 3 << 3; // bits 4:3, 0=SDMA
-        let host_ctrl_saved = unsafe { self.read_reg(sdmmc_regs::HOST_CTRL1) };
-        // 与 LicheeRV 一致：多块时拆成多次单块 DMA（FIFO 地址不变），避免部分 host 多块 DMA 时 CMD_CMPL 不置位
-        for block_idx in 0..block_count {
-            let off = (block_idx as usize) * BLOCKSIZE;
-            let (dma_ptr, dma_phys) = sdhci::alloc_dma_buffer(BLOCKSIZE).ok_or(-12)?;
-            unsafe {
-                let dma_slice = core::slice::from_raw_parts_mut(dma_ptr.as_ptr(), BLOCKSIZE);
-                dma_slice.copy_from_slice(&buf[off..off + BLOCKSIZE]);
-            }
-            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-            let arg = (1 << 31) | (func << 28) | (1 << 27) | (0 << 26) | (reg << 9) | 1;
-            let blk_val: u32 = (1 << 16) | (BLOCKSIZE as u32);
-            unsafe {
-                self.write_reg(sdmmc_regs::SDMA_SADDR, dma_phys as u32);
-                self.write_reg(sdmmc_regs::BLK_SIZE_AND_CNT, blk_val);
-                self.write_reg(sdmmc_regs::ARGUMENT, arg);
-                self.write_reg(sdmmc_regs::HOST_CTRL1, host_ctrl_saved & !HOST_CTRL1_DMA_SEL_MASK);
-                core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-                self.write_reg(sdmmc_regs::XFER_MODE_AND_CMD, CMD53_WRITE_MULTI_XFER_MODE);
-            }
-            let res = self.wait_cmd_complete()
-                .and_then(|_| self.wait_dma_complete())
-                .and_then(|_| {
-                    let resp = unsafe { self.read_reg(sdmmc_regs::RESP31_0) };
-                    if ((resp >> 16) & R5_ERROR_MASK) != 0 {
-                        log::error!(target: "wireless::bsp::sdio", "cmd53_write_blocks: R5 error block {} resp=0x{:08x}", block_idx, resp);
-                        Err(-5)
-                    } else {
-                        Ok(())
-                    }
-                });
-            unsafe { self.write_reg(sdmmc_regs::HOST_CTRL1, host_ctrl_saved) };
-            sdhci::release_dma_buffer();
-            if let Err(e) = res {
-                self.clear_int_status();
-                self.reset_dat_line();
-                return Err(e);
-            }
-            self.clear_int_status();
-            crate::delay_spin_ms(WAIT_INHIBIT_DELAY_MS);
-            self.wait_not_inhibit()?;
+        // 与 LicheeRV 一致：不在 send_command 开头清 INT_STATUS，在 IRQ 里按需清除
+        if self.process_sdio_pending_irqs_if_set() {
+            return Err(-11); // EAGAIN：已入队 work，调用方释放锁并 wait_sdio_irq_work_done 后重试
         }
+
+        let (dma_ptr, dma_phys) = sdhci::alloc_dma_buffer(count).ok_or(-12)?;
+        unsafe {
+            let dma_slice = core::slice::from_raw_parts_mut(dma_ptr.as_ptr(), count);
+            dma_slice.copy_from_slice(&buf[0..count]);
+        }
+        sdhci::cache::dma_flush_before_write(dma_ptr.as_ptr(), count);
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+
+        const HOST_CTRL1_DMA_SEL_MASK: u32 = 3 << 3;
+        let host_ctrl_saved = unsafe { self.read_reg(sdmmc_regs::HOST_CTRL1) };
+        let arg = sdhci::sdio_ops::mmc_io_rw_extended_arg_block(true, func, reg, false, block_count);
+        // 与 Linux sdhci_set_block_info 一致：BLOCK_SIZE 须含 sdma_boundary（SDHCI_MAKE_BLKSZ），否则多块 SDMA 不产生 DMA_END/DATA_END
+        let blk_val: u32 = (block_count << 16) | SDHCI_BLOCK_SIZE_WORD;
+        // 与 LicheeRV sdhci_prepare_data 顺序一致：initialize_data(字节数/bytes_xfered=0) → set_sdma_addr → config_dma → set_transfer_irqs → set_block_info
+        HOST_DMA_BASE_PHYS.store(dma_phys as u32, Ordering::SeqCst);
+        HOST_DMA_TOTAL.store(count, Ordering::SeqCst);
+        HOST_DMA_BYTES_XFERRED.store(0, Ordering::SeqCst);
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        unsafe {
+            self.write_reg(sdmmc_regs::SDMA_SADDR, dma_phys as u32);
+            self.write_reg(sdmmc_regs::HOST_CTRL1, host_ctrl_saved & !HOST_CTRL1_DMA_SEL_MASK);
+        }
+        self.set_transfer_irqs_dma();
+        unsafe {
+            self.write_reg(sdmmc_regs::BLK_SIZE_AND_CNT, blk_val);
+            self.write_reg(sdmmc_regs::ARGUMENT, arg);
+        }
+        // 与 LicheeRV sdhci.c 一致：有数据时发令前写 TIMEOUT_CONTROL=0x0E（BROKEN_TIMEOUT_VAL quirk）
+        unsafe { self.write_reg_8(sdmmc_regs::TIMEOUT_CONTROL, 0x0E) };
+        // 阶段1: 命令准备（已写 DMA 上下文 / SDMA_SADDR / HOST_CTRL1 / INT_EN+INT_SIG / BLK_SIZE_AND_CNT / ARGUMENT / TIMEOUT，未发 CMD）
+        {
+            let sdma = unsafe { self.read_reg(sdmmc_regs::SDMA_SADDR) };
+            let blk = unsafe { self.read_reg(sdmmc_regs::BLK_SIZE_AND_CNT) };
+            let arg_r = unsafe { self.read_reg(sdmmc_regs::ARGUMENT) };
+            let hc1 = unsafe { self.read_reg(sdmmc_regs::HOST_CTRL1) };
+            let present = unsafe { self.read_reg(sdmmc_regs::PRESENT_STS) };
+            let int_sts = unsafe { self.read_reg(sdmmc_regs::NORM_AND_ERR_INT_STS) };
+            log::warn!(target: "wireless::bsp::sdio", "cmd53_write_blocks 阶段: 命令准备 | SDMA_SADDR=0x{:08x} BLK_SIZE_AND_CNT=0x{:08x} ARGUMENT=0x{:08x} HOST_CTRL1=0x{:08x} PRESENT_STS=0x{:08x} INT_STS=0x{:08x}",
+                sdma, blk, arg_r, hc1, present, int_sts);
+        }
+        HOST_TRANSFER_CMD_PENDING.store(true, Ordering::SeqCst);
+        HOST_TRANSFER_DMA_PENDING.store(true, Ordering::SeqCst);
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        let xfer_mode_cmd = CMD53_WRITE_MULTI_XFER_MODE;
+        unsafe {
+            self.write_reg_16(sdmmc_regs::TRANSFER_MODE, (xfer_mode_cmd & 0xFFFF) as u16);
+            self.write_reg_16(sdmmc_regs::COMMAND, (xfer_mode_cmd >> 16) as u16);
+        }
+        // 阶段2: 命令发出
+        {
+            let xfer_cmd = unsafe { self.read_reg(sdmmc_regs::XFER_MODE_AND_CMD) };
+            let sdma = unsafe { self.read_reg(sdmmc_regs::SDMA_SADDR) };
+            let blk = unsafe { self.read_reg(sdmmc_regs::BLK_SIZE_AND_CNT) };
+            let arg_r = unsafe { self.read_reg(sdmmc_regs::ARGUMENT) };
+            let hc1 = unsafe { self.read_reg(sdmmc_regs::HOST_CTRL1) };
+            let present = unsafe { self.read_reg(sdmmc_regs::PRESENT_STS) };
+            let int_sts = unsafe { self.read_reg(sdmmc_regs::NORM_AND_ERR_INT_STS) };
+            let resp = unsafe { self.read_reg(sdmmc_regs::RESP31_0) };
+            log::warn!(target: "wireless::bsp::sdio", "cmd53_write_blocks 阶段: 命令发出 | XFER_MODE_AND_CMD=0x{:08x} SDMA_SADDR=0x{:08x} BLK=0x{:08x} ARG=0x{:08x} HOST_CTRL1=0x{:08x} PRESENT_STS=0x{:08x} INT_STS=0x{:08x} RESP31_0=0x{:08x}",
+                xfer_cmd, sdma, blk, arg_r, hc1, present, int_sts, resp);
+        }
+
+        // 与 LicheeRV 一致：仅等 CMD 完成中断再等 DATA 完成中断（无轮询）
+        let cmd_ok = self.wait_cmd_complete_irq();
+        // 阶段3: 等待命令完成
+        {
+            let xfer_cmd = unsafe { self.read_reg(sdmmc_regs::XFER_MODE_AND_CMD) };
+            let present = unsafe { self.read_reg(sdmmc_regs::PRESENT_STS) };
+            let int_sts = unsafe { self.read_reg(sdmmc_regs::NORM_AND_ERR_INT_STS) };
+            let resp = unsafe { self.read_reg(sdmmc_regs::RESP31_0) };
+            let inhibit_cmd = present & 1;
+            let inhibit_dat = (present >> 1) & 1;
+            log::warn!(target: "wireless::bsp::sdio", "cmd53_write_blocks 阶段: 等待命令完成 | 命令发送{} | XFER_MODE_AND_CMD=0x{:08x} PRESENT_STS=0x{:08x} inhibit_cmd={} inhibit_dat={} INT_STS=0x{:08x} RESP31_0=0x{:08x}",
+                if cmd_ok.is_ok() { "成功" } else { "失败" }, xfer_cmd, present, inhibit_cmd, inhibit_dat, int_sts, resp);
+        }
+        let res_after_cmd = match cmd_ok {
+            Ok(()) => self.wait_dma_complete_irq(),
+            Err(e) => Err(e),
+        };
+        // 阶段4: 等待数据完成（发出数据）
+        {
+            let present = unsafe { self.read_reg(sdmmc_regs::PRESENT_STS) };
+            let int_sts = unsafe { self.read_reg(sdmmc_regs::NORM_AND_ERR_INT_STS) };
+            let resp = unsafe { self.read_reg(sdmmc_regs::RESP31_0) };
+            let data_ok = res_after_cmd.is_ok();
+            log::warn!(target: "wireless::bsp::sdio", "cmd53_write_blocks 阶段: 等待数据完成 | 数据发送{} | PRESENT_STS=0x{:08x} INT_STS=0x{:08x} RESP31_0=0x{:08x}",
+                if data_ok { "成功" } else { "失败" }, present, int_sts, resp);
+        }
+        let res = res_after_cmd.and_then(|_| {
+            let resp = unsafe { self.read_reg(sdmmc_regs::RESP31_0) };
+            let r5_err = (resp >> 16) & R5_ERROR_MASK;
+            let processed_ok = r5_err == 0;
+            // 阶段5: R5 处理结果（数据接收/处理是否成功）
+            log::warn!(target: "wireless::bsp::sdio", "cmd53_write_blocks 阶段: R5处理 | 处理{} | RESP31_0=0x{:08x} R5_ERROR_MASK&resp=0x{:x}",
+                if processed_ok { "成功" } else { "失败" }, resp, r5_err);
+            if r5_err != 0 {
+                log::error!(target: "wireless::bsp::sdio", "cmd53_write_blocks: R5 error resp=0x{:08x}", resp);
+                Err(-5)
+            } else {
+                Ok(())
+            }
+        });
+        unsafe { self.write_reg(sdmmc_regs::HOST_CTRL1, host_ctrl_saved) };
+        sdhci::release_dma_buffer();
+        if let Err(e) = res {
+            // 阶段6: 出错后
+            let sdma = unsafe { self.read_reg(sdmmc_regs::SDMA_SADDR) };
+            let blk = unsafe { self.read_reg(sdmmc_regs::BLK_SIZE_AND_CNT) };
+            let arg_r = unsafe { self.read_reg(sdmmc_regs::ARGUMENT) };
+            let xfer_cmd = unsafe { self.read_reg(sdmmc_regs::XFER_MODE_AND_CMD) };
+            let hc1 = unsafe { self.read_reg(sdmmc_regs::HOST_CTRL1) };
+            let present = unsafe { self.read_reg(sdmmc_regs::PRESENT_STS) };
+            let int_sts = unsafe { self.read_reg(sdmmc_regs::NORM_AND_ERR_INT_STS) };
+            let resp = unsafe { self.read_reg(sdmmc_regs::RESP31_0) };
+            log::warn!(target: "wireless::bsp::sdio", "cmd53_write_blocks 阶段: 出错后 err={} | SDMA_SADDR=0x{:08x} BLK=0x{:08x} ARG=0x{:08x} XFER_CMD=0x{:08x} HOST_CTRL1=0x{:08x} PRESENT_STS=0x{:08x} INT_STS=0x{:08x} RESP31_0=0x{:08x}",
+                e, sdma, blk, arg_r, xfer_cmd, hc1, present, int_sts, resp);
+            self.clear_int_status();
+            self.reset_cmd_line();
+            self.reset_dat_line();
+            return Err(e);
+        }
+        self.clear_int_status();
+        crate::delay_spin_ms(WAIT_INHIBIT_DELAY_MS);
+        self.wait_not_inhibit()?;
         Ok(())
     }
 
-    /// CMD53 块模式多块读：一次读 N×512 字节（与 LicheeRV sdio_readsb 多块路径等价），仅使用 DMA（SDMA_SADDR + INT_DMA_END）。
+    /// CMD53 块模式多块读：一次 CMD53 读 N×512 字节（与 LicheeRV mmc_io_rw_extended 单次请求一致），DMA 单缓冲。
     ///
-    /// # 参数
-    /// - `addr`: 完整 SDIO 地址（func*0x100 + offset），FIFO 固定地址。
-    /// - `buf`: 写入数据的目标缓冲区，长度必须 >= block_count * 512。
-    /// - `block_count`: 块数（1..=511），每块 512 字节，与 Linux mmc_io_rw_extended 一致。
+    /// 寄存器顺序与 LicheeRV sdhci_prepare_data + sdhci_send_command 一致：SDMA_SADDR → HOST_CTRL(DMA_SEL) → BLK_SIZE_AND_CNT → ARGUMENT → XFER_MODE_AND_CMD；读完成后 dma_invalidate_after_read 再拷贝。
     fn cmd53_read_blocks(&self, addr: u32, buf: &mut [u8], block_count: u32) -> Result<(), i32> {
         const BLOCKSIZE: usize = 512;
         let count = (block_count as usize) * BLOCKSIZE;
@@ -1304,52 +1810,72 @@ impl Aic8800SdioHost {
         let reg = addr & 0xFF;
         log::info!(target: "wireless::bsp::sdio", "cmd53_read_blocks: addr=0x{:03x} blocks={} ({} bytes, F{} reg=0x{:02x})", addr, block_count, count, func, reg);
         self.wait_not_inhibit()?;
-        self.clear_int_status();
+        // 与 LicheeRV 一致：不在 send_command 开头清 INT_STATUS，在 IRQ 里按需清除
+        if self.process_sdio_pending_irqs_if_set() {
+            return Err(-11); // EAGAIN：已入队 work，调用方释放锁并 wait_sdio_irq_work_done 后重试
+        }
+
+        let (dma_ptr, dma_phys) = sdhci::alloc_dma_buffer(count).ok_or(-12)?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 
         const HOST_CTRL1_DMA_SEL_MASK: u32 = 3 << 3;
         let host_ctrl_saved = unsafe { self.read_reg(sdmmc_regs::HOST_CTRL1) };
-        for block_idx in 0..block_count {
-            let off = (block_idx as usize) * BLOCKSIZE;
-            let (dma_ptr, dma_phys) = sdhci::alloc_dma_buffer(BLOCKSIZE).ok_or(-12)?;
-            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-            let arg = (0 << 31) | (func << 28) | (1 << 27) | (0 << 26) | (reg << 9) | 1;
-            let blk_val: u32 = (1 << 16) | (BLOCKSIZE as u32);
-            unsafe {
-                self.write_reg(sdmmc_regs::SDMA_SADDR, dma_phys as u32);
-                self.write_reg(sdmmc_regs::BLK_SIZE_AND_CNT, blk_val);
-                self.write_reg(sdmmc_regs::ARGUMENT, arg);
-                self.write_reg(sdmmc_regs::HOST_CTRL1, host_ctrl_saved & !HOST_CTRL1_DMA_SEL_MASK);
-                core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-                self.write_reg(sdmmc_regs::XFER_MODE_AND_CMD, CMD53_READ_MULTI_XFER_MODE);
-            }
-            let res = self.wait_cmd_complete()
-                .and_then(|_| self.wait_dma_complete())
-                .and_then(|_| {
-                    let resp = unsafe { self.read_reg(sdmmc_regs::RESP31_0) };
-                    if ((resp >> 16) & R5_ERROR_MASK) != 0 {
-                        log::error!(target: "wireless::bsp::sdio", "cmd53_read_blocks: R5 error block {} resp=0x{:08x}", block_idx, resp);
-                        Err(-5)
-                    } else {
-                        Ok(())
-                    }
-                });
-            if res.is_ok() {
-                unsafe {
-                    let dma_slice = core::slice::from_raw_parts(dma_ptr.as_ptr(), BLOCKSIZE);
-                    buf[off..off + BLOCKSIZE].copy_from_slice(dma_slice);
-                }
-            }
-            unsafe { self.write_reg(sdmmc_regs::HOST_CTRL1, host_ctrl_saved) };
-            sdhci::release_dma_buffer();
-            if let Err(e) = res {
-                self.clear_int_status();
-                self.reset_dat_line();
-                return Err(e);
-            }
-            self.clear_int_status();
-            crate::delay_spin_ms(WAIT_INHIBIT_DELAY_MS);
-            self.wait_not_inhibit()?;
+        let arg = sdhci::sdio_ops::mmc_io_rw_extended_arg_block(false, func, reg, false, block_count);
+        // 与 Linux sdhci_set_block_info 一致：BLOCK_SIZE 须含 sdma_boundary（SDHCI_MAKE_BLKSZ）
+        let blk_val: u32 = (block_count << 16) | SDHCI_BLOCK_SIZE_WORD;
+        // 与 LicheeRV sdhci_prepare_data 顺序一致：DMA 上下文 → set_sdma_addr → config_dma → set_transfer_irqs → set_block_info
+        HOST_DMA_BASE_PHYS.store(dma_phys as u32, Ordering::SeqCst);
+        HOST_DMA_TOTAL.store(count, Ordering::SeqCst);
+        HOST_DMA_BYTES_XFERRED.store(0, Ordering::SeqCst);
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        unsafe {
+            self.write_reg(sdmmc_regs::SDMA_SADDR, dma_phys as u32);
+            self.write_reg(sdmmc_regs::HOST_CTRL1, host_ctrl_saved & !HOST_CTRL1_DMA_SEL_MASK);
         }
+        self.set_transfer_irqs_dma();
+        unsafe {
+            self.write_reg(sdmmc_regs::BLK_SIZE_AND_CNT, blk_val);
+            self.write_reg(sdmmc_regs::ARGUMENT, arg);
+        }
+        // 与 LicheeRV sdhci.c 一致：有数据时发令前写 TIMEOUT_CONTROL=0x0E
+        unsafe { self.write_reg_8(sdmmc_regs::TIMEOUT_CONTROL, 0x0E) };
+        HOST_TRANSFER_CMD_PENDING.store(true, Ordering::SeqCst);
+        HOST_TRANSFER_DMA_PENDING.store(true, Ordering::SeqCst);
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        let xfer_mode_cmd = CMD53_READ_MULTI_XFER_MODE;
+        unsafe {
+            self.write_reg_16(sdmmc_regs::TRANSFER_MODE, (xfer_mode_cmd & 0xFFFF) as u16);
+            self.write_reg_16(sdmmc_regs::COMMAND, (xfer_mode_cmd >> 16) as u16);
+        }
+        let res = self.wait_cmd_complete_irq()
+            .and_then(|_| self.wait_dma_complete_irq())
+            .and_then(|_| {
+                let resp = unsafe { self.read_reg(sdmmc_regs::RESP31_0) };
+                if ((resp >> 16) & R5_ERROR_MASK) != 0 {
+                    log::error!(target: "wireless::bsp::sdio", "cmd53_read_blocks: R5 error resp=0x{:08x}", resp);
+                    Err(-5)
+                } else {
+                    Ok(())
+                }
+            });
+        if res.is_ok() {
+            sdhci::cache::dma_invalidate_after_read(dma_ptr.as_ptr(), count);
+            unsafe {
+                let dma_slice = core::slice::from_raw_parts(dma_ptr.as_ptr(), count);
+                buf[0..count].copy_from_slice(dma_slice);
+            }
+        }
+        unsafe { self.write_reg(sdmmc_regs::HOST_CTRL1, host_ctrl_saved) };
+        sdhci::release_dma_buffer();
+        if let Err(e) = res {
+            self.clear_int_status();
+            self.reset_cmd_line();
+            self.reset_dat_line();
+            return Err(e);
+        }
+        self.clear_int_status();
+        crate::delay_spin_ms(WAIT_INHIBIT_DELAY_MS);
+        self.wait_not_inhibit()?;
         Ok(())
     }
 

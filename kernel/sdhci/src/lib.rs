@@ -1,9 +1,17 @@
-//! DMA 缓冲区分配，供 wireless BSP SDIO 大块传输使用（sdhci  crate，原 dma）。
+//! LicheeRV writesb/readsb 底层：DMA 缓冲、SDIO arg、cache 一致性、寄存器/流程常量。
 //!
-//! 与 LicheeRV 中 host 使用 DMA 进行 CMD53 数据阶段一致：分配物理连续、设备可访问的
-//! 内存，供 SDMMC 控制器 SDMA 使用。假定内核为恒等映射（virt = phys）。
+//! 与 LicheeRV-Nano-Build/linux_5.10 对齐：
+//! - sdio_ops.c mmc_io_rw_extended → arg/blksz/blocks
+//! - sdio_io.c sdio_io_rw_ext_helper → 块模式 511 块上限
+//! - sdhci.c/h 寄存器偏移、BLK_SIZE/BLK_COUNT、下发顺序
 
 #![no_std]
+
+pub mod cache;
+pub mod flow;
+pub mod sdhci;
+pub mod sdio_io;
+pub mod sdio_ops;
 
 use core::ptr::NonNull;
 use spin::Mutex;

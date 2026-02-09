@@ -43,8 +43,9 @@ static BUSTX_WAIT_QUEUE: WaitQueue = WaitQueue::new();
 /// 调用方等待“CMD 已写入 WR_FIFO”的队列：bustx 在 send_msg 完成后 notify_tx_done()，与 LicheeRV wake_up(&cmd_txdone_wait) 一致
 static TX_DONE_WAIT_QUEUE: WaitQueue = WaitQueue::new();
 
-/// PLIC 触发的 SDIO 卡中断：唤醒 busrx，由 busrx 执行 run_poll_rx_one 读 BLOCK_CNT/RD_FIFO（与 LicheeRV aicwf_sdio_hal_irqhandler → complete(busrx_trgg) 一致）。
+/// PLIC 触发的 SDIO 卡中断：先由 backend 处理 CMD/DATA 完成（读 INT_STATUS、清除、complete），再唤醒 busrx（与 LicheeRV sdhci_irq → sdhci_cmd_irq/sdhci_data_irq + complete 一致）。
 fn sdio_irq_handler() {
+    super::backend::handle_sdhci_host_irq();
     SDIO_WAIT_QUEUE.notify_one(false);
 }
 
@@ -131,4 +132,34 @@ pub fn notify_tx_done() {
 /// 调用方阻塞等待“CMD 已写入 WR_FIFO”或超时。若在 dur 内被 notify_tx_done 唤醒则返回 false；超时返回 true。
 pub fn wait_tx_done_timeout(dur: Duration) -> bool {
     TX_DONE_WAIT_QUEUE.wait_timeout(dur)
+}
+
+// ---------- CARD_INT 排队 work、异步执行（与 LicheeRV sdio_irq.c queue_delayed_work + sdio_irq_work 对齐）----------
+
+/// Worker 线程等待“有 CARD_INT 待处理”的队列：传输入口检测到 CARD_INT 后 notify，worker 在此阻塞等待。
+static SDIO_IRQ_WORK_QUEUE: WaitQueue = WaitQueue::new();
+
+/// 传输入口在入队后等待“worker 已执行 sdio_run_irqs”的队列：worker 完成后 notify，避免持锁死锁。
+static SDIO_IRQ_WORK_DONE_QUEUE: WaitQueue = WaitQueue::new();
+
+/// 检测到 CARD_INT 时由 backend 调用：唤醒 sdio_irq_work 线程，与 LicheeRV queue_delayed_work(..., 0) 一致。
+#[inline]
+pub fn notify_sdio_irq_work() {
+    SDIO_IRQ_WORK_QUEUE.notify_one(false);
+}
+
+/// sdio_irq_work 线程阻塞等待“有 work”或超时。若在 dur 内被 notify_sdio_irq_work 唤醒则返回 false；超时返回 true。
+pub fn wait_sdio_irq_work_or_timeout(dur: Duration) -> bool {
+    SDIO_IRQ_WORK_QUEUE.wait_timeout(dur)
+}
+
+/// worker 执行完 sdio_run_irqs 后调用，唤醒正在 wait_sdio_irq_work_done_timeout 的传输入口。
+#[inline]
+pub fn notify_sdio_irq_work_done() {
+    SDIO_IRQ_WORK_DONE_QUEUE.notify_one(true);
+}
+
+/// 传输入口在入队后（释放锁后）阻塞等待 work 完成或超时。若在 dur 内被唤醒则返回 false；超时返回 true。
+pub fn wait_sdio_irq_work_done_timeout(dur: Duration) -> bool {
+    SDIO_IRQ_WORK_DONE_QUEUE.wait_timeout(dur)
 }
